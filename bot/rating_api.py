@@ -17,7 +17,7 @@ class TournamentSummary:
     name: str
     date_start: str
     date_end: str
-    true_dl: Optional[float]
+    difficulty_forecast: Optional[float]
     editors: list[dict[str, Any]]
     type_short_name: Optional[str]
 
@@ -143,7 +143,7 @@ class RatingApiClient:
                         name=str(row.get("name", "Без названия")),
                         date_start=str(row.get("dateStart", "")),
                         date_end=str(row.get("dateEnd", "")),
-                        true_dl=row.get("trueDL"),
+                        difficulty_forecast=row.get("difficultyForecast"),
                         editors=row.get("editors") or [],
                         type_short_name=tournament_type.get("shortName"),
                     )

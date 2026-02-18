@@ -132,14 +132,14 @@ def format_tournament_message(tournament: TournamentSummary) -> str:
     if not editors:
         editors = "не указаны"
 
-    true_dl = "не указан"
-    if isinstance(tournament.true_dl, (int, float)):
-        true_dl = f"{float(tournament.true_dl):.2f}"
+    difficulty_forecast = "не указана"
+    if isinstance(tournament.difficulty_forecast, (int, float)):
+        difficulty_forecast = f"{float(tournament.difficulty_forecast):.2f}"
 
     return (
         f"<b>{tournament.name}</b>\n"
         f"Редакторы: {editors}\n"
-        f"True DL: {true_dl}"
+        f"Заявленная сложность: {difficulty_forecast}"
     )
 
 
