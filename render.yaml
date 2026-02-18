@@ -6,6 +6,8 @@ services:
     startCommand: python -m bot.main
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: RATING_API_BASE
