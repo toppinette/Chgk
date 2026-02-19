@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,13 +40,20 @@ ROLE_LABELS: dict[str, str] = {
 
 MENU_LOGIN = "Авторизоваться"
 MENU_ROLE = "Выбрать роль"
-MENU_SYNC = "Турниры типа С"
+MENU_SYNC = "Показать синхроны"
 MENU_POLL = "Создать опрос"
 MENU_LOGOUT = "Выйти"
 
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
 PENDING_ORGANIZER_DATE = "organizer_date"
+
+DATE_PICKER_DAYS = 21
+DATE_CALLBACK_IGNORE = "date:ignore"
+DATE_CALLBACK_MANUAL = "date:manual"
+DATE_CALLBACK_PICK_PREFIX = "date:pick:"
+
+WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 
 @dataclass(slots=True)
@@ -107,6 +115,43 @@ def build_role_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def build_date_picker_markup(*, window_days: int = DATE_PICKER_DAYS) -> InlineKeyboardMarkup:
+    today = date.today()
+    end_day = today + timedelta(days=window_days - 1)
+    calendar_start = today - timedelta(days=today.weekday())
+    calendar_end = end_day + timedelta(days=(6 - end_day.weekday()))
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS]
+    ]
+
+    cursor = calendar_start
+    while cursor <= calendar_end:
+        week_row: list[InlineKeyboardButton] = []
+        for _ in range(7):
+            if today <= cursor <= end_day:
+                label = str(cursor.day)
+                if cursor == today:
+                    label = f"•{cursor.day}"
+                week_row.append(
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{cursor.isoformat()}",
+                    )
+                )
+            else:
+                week_row.append(
+                    InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE)
+                )
+            cursor += timedelta(days=1)
+        rows.append(week_row)
+
+    rows.append(
+        [InlineKeyboardButton("✍️ Ввести дату вручную", callback_data=DATE_CALLBACK_MANUAL)]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def format_player_name(player: dict[str, Any]) -> str:
     if not isinstance(player, dict):
         return "Неизвестный редактор"
@@ -160,7 +205,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Бот для rating.chgk.info готов.\n"
         "1) Нажмите «Авторизоваться»\n"
         "2) Выберите роль\n"
-        "3) Для роли организатора откройте «Турниры типа С»",
+        "3) Для роли организатора нажмите «Показать синхроны»",
         reply_markup=build_main_keyboard(),
     )
 
@@ -229,11 +274,16 @@ async def request_organizer_date(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     state = get_runtime_state(context, update.effective_user.id)
-    state.pending_action = PENDING_ORGANIZER_DATE
+    state.pending_action = None
 
+    today = date.today()
+    end_day = today + timedelta(days=DATE_PICKER_DAYS - 1)
     await update.message.reply_text(
-        "Введите дату в формате YYYY-MM-DD (например, 2026-03-10).",
-        reply_markup=build_main_keyboard(),
+        (
+            "Выберите дату для синхронов.\n"
+            f"Доступный диапазон: {today.isoformat()} — {end_day.isoformat()}."
+        ),
+        reply_markup=build_date_picker_markup(),
     )
 
 
@@ -249,7 +299,7 @@ async def send_tournaments_for_date(
     persisted = storage.get_user_state(user_id)
     runtime_state = get_runtime_state(context, user_id)
 
-    await context.bot.send_message(chat_id=chat_id, text="Ищу турниры типа С на выбранную дату...")
+    await context.bot.send_message(chat_id=chat_id, text="Ищу синхроны на выбранную дату...")
 
     tournaments = await api.get_sync_tournaments_by_date(
         target_date,
@@ -265,7 +315,7 @@ async def send_tournaments_for_date(
     if not tournaments:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Турниры типа С на эту дату не найдены.",
+            text="Синхроны на эту дату не найдены.",
             reply_markup=build_main_keyboard(),
         )
         return
@@ -429,6 +479,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
         return
 
+    if data == DATE_CALLBACK_IGNORE:
+        await query.answer()
+        return
+
+    if data == DATE_CALLBACK_MANUAL:
+        state = get_runtime_state(context, user_id)
+        state.pending_action = PENDING_ORGANIZER_DATE
+        await query.answer()
+        await query.edit_message_text(
+            "Введите дату в формате YYYY-MM-DD (например, 2026-03-10)."
+        )
+        return
+
+    if data.startswith(DATE_CALLBACK_PICK_PREFIX):
+        if update.effective_chat is None:
+            await query.answer()
+            return
+
+        storage = get_storage(context)
+        persisted = storage.get_user_state(user_id)
+        if persisted.role != "organizer":
+            await query.answer("Сначала выберите роль «организатор».", show_alert=True)
+            return
+
+        raw_date = data.removeprefix(DATE_CALLBACK_PICK_PREFIX)
+        try:
+            target_date = date.fromisoformat(raw_date)
+        except ValueError:
+            await query.answer("Некорректная дата.", show_alert=True)
+            return
+
+        await query.answer(f"Выбрана дата: {target_date.isoformat()}")
+        try:
+            await query.edit_message_text(f"Дата выбрана: {target_date.isoformat()}")
+        except Exception:
+            pass
+
+        state = get_runtime_state(context, user_id)
+        state.pending_action = None
+
+        try:
+            await send_tournaments_for_date(
+                context=context,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                target_date=target_date,
+            )
+        except RatingApiError as exc:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Не удалось получить турниры: {exc}",
+                reply_markup=build_main_keyboard(),
+            )
+        return
+
     await query.answer()
 
 
@@ -528,6 +633,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def ensure_db_path(db_path: Path) -> Path:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_db_path = Path("/opt/render/project/src/bot.db")
+
+    # Preserve previously saved role/token on first run after moving DB to persistent disk.
+    if db_path != legacy_db_path and not db_path.exists() and legacy_db_path.exists():
+        try:
+            shutil.copy2(legacy_db_path, db_path)
+        except OSError:
+            pass
+
+    return db_path
+
+
 def main() -> None:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
@@ -542,7 +661,7 @@ def main() -> None:
 
     rating_api_base = os.getenv("RATING_API_BASE", "https://api.rating.chgk.info")
     rating_api_timeout = float(os.getenv("RATING_API_TIMEOUT", "15"))
-    db_path = Path(os.getenv("BOT_DB_PATH", "bot.db"))
+    db_path = ensure_db_path(Path(os.getenv("BOT_DB_PATH", "bot.db")))
 
     application = Application.builder().token(telegram_token).build()
 
