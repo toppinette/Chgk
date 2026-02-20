@@ -193,6 +193,15 @@ def truncate_option(text: str, max_len: int = 100) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def get_callback_chat_id(update: Update) -> int | None:
+    query = update.callback_query
+    if query is not None and query.message is not None and query.message.chat is not None:
+        return query.message.chat.id
+    if update.effective_chat is not None:
+        return update.effective_chat.id
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
@@ -434,6 +443,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     data = query.data or ""
     user_id = update.effective_user.id
+    callback_chat_id = get_callback_chat_id(update)
 
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
@@ -479,11 +489,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "poll:create":
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
         await query.answer()
-        await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
+        await create_poll(context=context, chat_id=callback_chat_id, user_id=user_id)
         return
 
     if data == DATE_CALLBACK_IGNORE:
@@ -500,8 +510,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(DATE_CALLBACK_PICK_PREFIX):
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         storage = get_storage(context)
@@ -529,13 +539,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await send_tournaments_for_date(
                 context=context,
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 user_id=user_id,
                 target_date=target_date,
             )
         except RatingApiError as exc:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 text=f"Не удалось получить турниры: {exc}",
                 reply_markup=hide_main_keyboard(),
             )
@@ -641,6 +651,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    command_token = (update.message.text or "").strip().split(maxsplit=1)[0]
+    command_name = command_token[1:].split("@", 1)[0].casefold() if command_token.startswith("/") else ""
+
+    if command_name == "start":
+        await start(update, context)
+        return
+    if command_name == "login":
+        await login(update, context)
+        return
+    if command_name == "logout":
+        await logout(update, context)
+        return
+    if command_name == "role":
+        await choose_role(update, context)
+        return
+    if command_name == "date":
+        await request_representative_date(update, context)
+        return
+    if command_name == "poll":
+        await poll_command(update, context)
+        return
+    if command_name == "cancel":
+        await cancel(update, context)
+        return
+
+    await update.message.reply_text(
+        "Команда не распознана. Доступно: /start, /login, /role, /date, /poll, /cancel, /logout.",
+        reply_markup=hide_main_keyboard(),
+    )
+
+
 def ensure_db_path(db_path: Path) -> Path:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     legacy_db_path = Path("/opt/render/project/src/bot.db")
@@ -689,6 +734,7 @@ def main() -> None:
     application.add_handler(CommandHandler("poll", poll_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.COMMAND, handle_unmatched_command))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
