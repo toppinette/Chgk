@@ -12,6 +12,7 @@ from typing import Any
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
 )
@@ -35,12 +36,15 @@ ROLE_LABELS: dict[str, str] = {
     "representative": "представитель",
 }
 
-MENU_LOGIN = "авторизоваться"
-MENU_ROLE = "выбрать роль"
-MENU_SYNC = "показать синхроны"
-MENU_POLL = "создать опрос"
-MENU_REQUEST = "подать заявку"
-MENU_LOGOUT = "выйти"
+MENU_LOGIN = "Авторизация"
+MENU_ROLE = "Выбрать роль"
+MENU_CHANGE_ROLE = "Изменить роль"
+MENU_SYNC = "Показать синхроны"
+MENU_CREATE_VENUE = "Создать площадку"
+MENU_LOGOUT = "Выйти"
+
+MENU_POLL_LEGACY = "создать опрос"
+MENU_REQUEST_LEGACY = "подать заявку"
 
 POLL_OPTION_ANY = "Буду играть любой"
 POLL_OPTION_NONE = "Не буду играть ни один"
@@ -108,6 +112,35 @@ def get_rating_site(context: ContextTypes.DEFAULT_TYPE) -> RatingSiteClient:
 
 def hide_main_keyboard() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
+
+
+def build_main_menu_markup(*, is_authorized: bool, role: str | None) -> ReplyKeyboardMarkup:
+    if not is_authorized:
+        keyboard = [[MENU_LOGIN]]
+    elif role == "representative":
+        keyboard = [
+            [MENU_SYNC, MENU_CREATE_VENUE],
+            [MENU_CHANGE_ROLE, MENU_LOGOUT],
+        ]
+    elif role in ROLE_LABELS:
+        keyboard = [[MENU_CHANGE_ROLE, MENU_LOGOUT]]
+    else:
+        keyboard = [[MENU_ROLE, MENU_LOGOUT]]
+
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def main_menu_markup(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
+    storage = get_storage(context)
+    persisted = storage.get_user_state(user_id)
+    return build_main_menu_markup(
+        is_authorized=bool(persisted.rating_token),
+        role=persisted.role,
+    )
 
 
 def tournament_markup(tournament_id: int, selected: bool) -> InlineKeyboardMarkup:
@@ -263,14 +296,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime_state.pending_action = None
     runtime_state.request_draft = None
 
+    storage = get_storage(context)
+    persisted = storage.get_user_state(update.effective_user.id)
+
+    if not persisted.rating_token:
+        text = "Бот готов. Нажмите «Авторизация» в меню."
+    elif persisted.role == "representative":
+        text = "Вы авторизованы как представитель. Выберите действие в меню."
+    elif persisted.role in ROLE_LABELS:
+        text = f"Вы авторизованы. Текущая роль: {ROLE_LABELS[persisted.role]}."
+    else:
+        text = "Вы авторизованы. Теперь выберите роль."
+
     await update.message.reply_text(
-        "Бот для rating.chgk.info готов.\n"
-        "1) Введите /login\n"
-        "2) Введите /role\n"
-        "3) Для роли «представитель» нажмите /date\n"
-        "4) Для заявки на синхрон нажмите /request\n"
-        "5) После выбора турниров нажмите /poll",
-        reply_markup=hide_main_keyboard(),
+        text,
+        reply_markup=main_menu_markup(context, update.effective_user.id),
     )
 
 
@@ -283,7 +323,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state.temp_email = None
     state.request_draft = None
 
-    await update.message.reply_text("Текущее действие отменено.", reply_markup=hide_main_keyboard())
+    await update.message.reply_text(
+        "Текущее действие отменено.",
+        reply_markup=main_menu_markup(context, update.effective_user.id),
+    )
 
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -296,7 +339,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Введите email от rating.chgk.info.",
-        reply_markup=hide_main_keyboard(),
+        reply_markup=main_menu_markup(context, update.effective_user.id),
     )
 
 
@@ -312,7 +355,10 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state.temp_email = None
     state.request_draft = None
 
-    await update.message.reply_text("Сессия rating очищена.", reply_markup=hide_main_keyboard())
+    await update.message.reply_text(
+        "Сессия rating очищена.",
+        reply_markup=main_menu_markup(context, update.effective_user.id),
+    )
 
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,6 +368,30 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "Выберите роль:",
         reply_markup=build_role_keyboard(),
+    )
+
+
+async def create_venue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.effective_user is None:
+        return
+
+    storage = get_storage(context)
+    persisted = storage.get_user_state(update.effective_user.id)
+
+    if not persisted.rating_token:
+        text = "Сначала авторизуйтесь через меню."
+    elif persisted.role != "representative":
+        text = "Функция доступна только для роли «представитель»."
+    else:
+        text = (
+            "Создание площадки в боте пока отключено.\n"
+            "Используйте форму на rating.chgk.info, затем вернитесь в бот."
+        )
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=main_menu_markup(context, update.effective_user.id),
     )
 
 
@@ -335,7 +405,7 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     if persisted.role != "representative":
         await update.message.reply_text(
             "Эта функция доступна для роли «представитель». Сначала выберите роль.",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, update.effective_user.id),
         )
         return
 
@@ -368,7 +438,7 @@ async def start_request_flow(
         await context.bot.send_message(
             chat_id=chat_id,
             text="Подача заявки доступна только для роли «представитель».",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, user_id),
         )
         return
 
@@ -376,7 +446,7 @@ async def start_request_flow(
         await context.bot.send_message(
             chat_id=chat_id,
             text="Нужно выполнить /login, чтобы сохранить email для входа на сайт.",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, user_id),
         )
         return
 
@@ -395,13 +465,13 @@ async def start_request_flow(
                     "Введите ID турнира для подачи заявки.\n"
                     f"Недавно загруженные ID: {sample}"
                 ),
-                reply_markup=hide_main_keyboard(),
+                reply_markup=main_menu_markup(context, user_id),
             )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Введите ID турнира (число).",
-                reply_markup=hide_main_keyboard(),
+                reply_markup=main_menu_markup(context, user_id),
             )
         return
 
@@ -409,7 +479,7 @@ async def start_request_flow(
     await context.bot.send_message(
         chat_id=chat_id,
         text="Шаг 1/6: введите ID площадки (venue ID).",
-        reply_markup=hide_main_keyboard(),
+        reply_markup=main_menu_markup(context, user_id),
     )
 
 
@@ -454,7 +524,7 @@ async def send_tournaments_for_date(
         await context.bot.send_message(
             chat_id=chat_id,
             text="Синхроны на эту дату не найдены.",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, user_id),
         )
         return
 
@@ -586,6 +656,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.answer()
         await query.edit_message_text(f"Роль установлена: {ROLE_LABELS[role]}.")
+        if callback_chat_id is not None:
+            await context.bot.send_message(
+                chat_id=callback_chat_id,
+                text="Роль обновлена. Выберите действие в меню.",
+                reply_markup=main_menu_markup(context, user_id),
+            )
         return
 
     if data.startswith("vote:"):
@@ -693,7 +769,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=callback_chat_id,
                 text=f"Не удалось получить турниры: {exc}",
-                reply_markup=hide_main_keyboard(),
+                reply_markup=main_menu_markup(context, user_id),
             )
         return
 
@@ -709,21 +785,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     state = get_runtime_state(context, user_id)
 
-    if text_normalized == MENU_LOGIN:
+    if text_normalized == MENU_LOGIN.casefold():
         await login(update, context)
         return
-    if text_normalized == MENU_ROLE:
+    if text_normalized in {MENU_ROLE.casefold(), MENU_CHANGE_ROLE.casefold()}:
         await choose_role(update, context)
         return
-    if text_normalized == MENU_SYNC:
+    if text_normalized == MENU_SYNC.casefold():
         await request_representative_date(update, context)
         return
-    if text_normalized == MENU_POLL:
+    if text_normalized == MENU_CREATE_VENUE.casefold():
+        await create_venue(update, context)
+        return
+    if text_normalized == MENU_POLL_LEGACY.casefold():
         if update.effective_chat is None:
             return
         await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
         return
-    if text_normalized == MENU_REQUEST:
+    if text_normalized == MENU_REQUEST_LEGACY.casefold():
         if update.effective_chat is None:
             return
         await start_request_flow(
@@ -733,7 +812,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             tournament_id=None,
         )
         return
-    if text_normalized == MENU_LOGOUT:
+    if text_normalized == MENU_LOGOUT.casefold():
         await logout(update, context)
         return
 
@@ -780,7 +859,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"Авторизация успешна.{suffix}",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, user_id),
         )
         return
 
@@ -963,13 +1042,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reset_request_draft(state)
         await update.message.reply_text(
             f"{result.message}\nURL: {result.final_url}",
-            reply_markup=hide_main_keyboard(),
+            reply_markup=main_menu_markup(context, user_id),
         )
         return
 
     await update.message.reply_text(
-        "Не понял команду. Используйте /start или команды /login, /role, /date, /request, /poll.",
-        reply_markup=hide_main_keyboard(),
+        "Не понял сообщение. Используйте кнопки меню или /start.",
+        reply_markup=main_menu_markup(context, user_id),
     )
 
 
@@ -1001,13 +1080,21 @@ async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT
     if command_name == "poll":
         await poll_command(update, context)
         return
+    if command_name in {"create_venue", "venue"}:
+        await create_venue(update, context)
+        return
     if command_name == "cancel":
         await cancel(update, context)
         return
 
     await update.message.reply_text(
-        "Команда не распознана. Доступно: /start, /login, /role, /date, /request, /poll, /cancel, /logout.",
-        reply_markup=hide_main_keyboard(),
+        (
+            "Команда не распознана. Доступно: /start, /login, /role, /date, "
+            "/poll, /request, /create_venue, /cancel, /logout."
+        ),
+        reply_markup=main_menu_markup(context, update.effective_user.id)
+        if update.effective_user is not None
+        else hide_main_keyboard(),
     )
 
 
@@ -1015,7 +1102,10 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     logging.exception("Unhandled exception while processing update", exc_info=context.error)
 
     chat_id: int | None = None
+    user_id: int | None = None
     if isinstance(update, Update):
+        if update.effective_user is not None:
+            user_id = update.effective_user.id
         if update.effective_chat is not None:
             chat_id = update.effective_chat.id
         elif (
@@ -1033,7 +1123,9 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Произошла внутренняя ошибка. "
                     "Попробуйте повторить команду через несколько секунд."
                 ),
-                reply_markup=hide_main_keyboard(),
+                reply_markup=main_menu_markup(context, user_id)
+                if user_id is not None
+                else hide_main_keyboard(),
             )
         except Exception:
             logging.exception("Failed to notify user about internal error")
@@ -1092,6 +1184,8 @@ def main() -> None:
     application.add_handler(CommandHandler("date", request_representative_date))
     application.add_handler(CommandHandler("request", request_command))
     application.add_handler(CommandHandler("poll", poll_command))
+    application.add_handler(CommandHandler("create_venue", create_venue))
+    application.add_handler(CommandHandler("venue", create_venue))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.COMMAND, handle_unmatched_command))
