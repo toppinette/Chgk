@@ -429,39 +429,47 @@ async def start_create_venue_flow(
     user_id: int,
     tournament_id: int | None = None,
 ) -> None:
-    storage = get_storage(context)
-    persisted = storage.get_user_state(user_id)
+    try:
+        storage = get_storage(context)
+        persisted = storage.get_user_state(user_id)
 
-    if persisted.role != "representative":
+        if persisted.role != "representative":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Создание площадки доступно для роли «представитель». Сначала выберите роль.",
+                reply_markup=hide_main_keyboard(),
+            )
+            return
+
+        if not persisted.rating_token:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Сначала авторизуйтесь через /login, чтобы создавать площадки.",
+                reply_markup=hide_main_keyboard(),
+            )
+            return
+
+        state = get_runtime_state(context, user_id)
+        state.pending_action = PENDING_VENUE_TOWN
+        state.venue_draft = VenueDraft(tournament_id=tournament_id)
+        state.town_candidates.clear()
+        state.venue_type_candidates.clear()
+
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Создание площадки доступно для роли «представитель». Сначала выберите роль.",
+            text=(
+                "Создание площадки.\n"
+                "Шаг 1/5: введите город (например, Москва)."
+            ),
             reply_markup=hide_main_keyboard(),
         )
-        return
-
-    if not persisted.rating_token:
+    except Exception as exc:
+        logging.exception("Failed to start venue flow for user=%s", user_id)
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Сначала авторизуйтесь через /login, чтобы создавать площадки.",
+            text=f"Не удалось запустить создание площадки: {exc}",
             reply_markup=hide_main_keyboard(),
         )
-        return
-
-    state = get_runtime_state(context, user_id)
-    state.pending_action = PENDING_VENUE_TOWN
-    state.venue_draft = VenueDraft(tournament_id=tournament_id)
-    state.town_candidates.clear()
-    state.venue_type_candidates.clear()
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "Создание площадки.\n"
-            "Шаг 1/5: введите город (например, Москва)."
-        ),
-        reply_markup=hide_main_keyboard(),
-    )
 
 
 async def create_venue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1136,6 +1144,7 @@ def main() -> None:
     application.add_handler(CommandHandler("role", choose_role))
     application.add_handler(CommandHandler("date", request_representative_date))
     application.add_handler(CommandHandler("venue", create_venue_command))
+    application.add_handler(CommandHandler("create_venue", create_venue_command))
     application.add_handler(CommandHandler("poll", poll_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
