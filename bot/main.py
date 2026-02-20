@@ -280,8 +280,8 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     end_day = get_date_picker_end(DATE_PICKER_DAYS)
     await update.message.reply_text(
         (
-            "Выберите дату для синхронов.\n"
-            f"Доступный диапазон: {today.isoformat()} — {end_day.isoformat()}."
+            "Выберите дату проведения синхрона.\n"
+            f"Ближайший диапазон: {today.isoformat()} — {end_day.isoformat()}."
         ),
         reply_markup=build_date_picker_markup(),
     )
