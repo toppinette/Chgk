@@ -107,7 +107,7 @@ def get_rating_site(context: ContextTypes.DEFAULT_TYPE) -> RatingSiteClient:
 
 
 def hide_main_keyboard() -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove(remove_keyboard=True)
+    return ReplyKeyboardRemove()
 
 
 def tournament_markup(tournament_id: int, selected: bool) -> InlineKeyboardMarkup:
@@ -1011,6 +1011,34 @@ async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Unhandled exception while processing update", exc_info=context.error)
+
+    chat_id: int | None = None
+    if isinstance(update, Update):
+        if update.effective_chat is not None:
+            chat_id = update.effective_chat.id
+        elif (
+            update.callback_query is not None
+            and update.callback_query.message is not None
+            and update.callback_query.message.chat is not None
+        ):
+            chat_id = update.callback_query.message.chat.id
+
+    if chat_id is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Произошла внутренняя ошибка. "
+                    "Попробуйте повторить команду через несколько секунд."
+                ),
+                reply_markup=hide_main_keyboard(),
+            )
+        except Exception:
+            logging.exception("Failed to notify user about internal error")
+
+
 def ensure_db_path(db_path: Path) -> Path:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     legacy_db_path = Path("/opt/render/project/src/bot.db")
@@ -1067,6 +1095,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.COMMAND, handle_unmatched_command))
+    application.add_error_handler(handle_error)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
