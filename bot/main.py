@@ -318,6 +318,18 @@ def format_venue_draft_summary(draft: VenueDraft) -> str:
     )
 
 
+def get_callback_chat_id(update: Update, query: Any) -> int | None:
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    if chat is not None and getattr(chat, "id", None) is not None:
+        return int(chat.id)
+
+    if update.effective_chat is not None:
+        return int(update.effective_chat.id)
+
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
@@ -633,6 +645,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     user_id = update.effective_user.id
     state = get_runtime_state(context, user_id)
+    callback_chat_id = get_callback_chat_id(update, query)
 
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
@@ -645,9 +658,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.answer()
         await query.edit_message_text(f"Роль установлена: {ROLE_LABELS[role]}.")
-        if role == "representative" and update.effective_chat is not None:
+        if role == "representative" and callback_chat_id is not None:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 text="Новая функция: создание площадки.",
                 reply_markup=InlineKeyboardMarkup(
                     [
@@ -692,8 +705,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(VENUE_CALLBACK_START_PREFIX):
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         raw_id = data.removeprefix(VENUE_CALLBACK_START_PREFIX)
@@ -701,7 +714,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await start_create_venue_flow(
             context=context,
-            chat_id=update.effective_chat.id,
+            chat_id=callback_chat_id,
             user_id=user_id,
             tournament_id=tournament_id,
         )
@@ -715,8 +728,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(VENUE_CALLBACK_TOWN_PREFIX):
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         raw_id = data.removeprefix(VENUE_CALLBACK_TOWN_PREFIX)
@@ -740,15 +753,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer(f"Город: {town.name}")
         await query.edit_message_text(f"Город выбран: {format_town_label(town)}")
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=callback_chat_id,
             text="Шаг 2/5: введите название площадки.",
             reply_markup=hide_main_keyboard(),
         )
         return
 
     if data.startswith(VENUE_CALLBACK_TYPE_PREFIX):
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         raw_id = data.removeprefix(VENUE_CALLBACK_TYPE_PREFIX)
@@ -772,7 +785,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer(f"Тип: {venue_type.name}")
         await query.edit_message_text(f"Тип площадки: {venue_type.name}")
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=callback_chat_id,
             text="Шаг 4/5: введите адрес площадки или «-», чтобы пропустить.",
             reply_markup=hide_main_keyboard(),
         )
@@ -785,8 +798,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == VENUE_CALLBACK_SUBMIT:
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         draft = state.venue_draft
@@ -822,7 +835,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         except RatingApiError as exc:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 text=f"Не удалось создать площадку: {exc}",
                 reply_markup=hide_main_keyboard(),
             )
@@ -841,18 +854,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         suffix = f" (ID {venue_id})" if isinstance(venue_id, int) else ""
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=callback_chat_id,
             text=f"Создана площадка: {venue_name_label}{suffix}",
             reply_markup=hide_main_keyboard(),
         )
         return
 
     if data == "poll:create":
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
         await query.answer()
-        await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
+        await create_poll(context=context, chat_id=callback_chat_id, user_id=user_id)
         return
 
     if data == DATE_CALLBACK_IGNORE:
@@ -869,8 +882,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(DATE_CALLBACK_PICK_PREFIX):
-        if update.effective_chat is None:
-            await query.answer()
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
             return
 
         storage = get_storage(context)
@@ -897,13 +910,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await send_tournaments_for_date(
                 context=context,
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 user_id=user_id,
                 target_date=target_date,
             )
         except RatingApiError as exc:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=callback_chat_id,
                 text=f"Не удалось получить турниры: {exc}",
                 reply_markup=hide_main_keyboard(),
             )
