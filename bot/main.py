@@ -645,6 +645,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.answer()
         await query.edit_message_text(f"Роль установлена: {ROLE_LABELS[role]}.")
+        if role == "representative" and update.effective_chat is not None:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Новая функция: создание площадки.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🏟 Создать площадку",
+                                callback_data=f"{VENUE_CALLBACK_START_PREFIX}0",
+                            )
+                        ]
+                    ]
+                ),
+            )
         return
 
     if data.startswith("vote:"):
