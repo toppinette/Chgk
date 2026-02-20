@@ -1098,6 +1098,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    raw_text = (update.message.text or "").strip()
+    if not raw_text.startswith("/"):
+        return
+
+    command_token = raw_text.split(maxsplit=1)[0]
+    command_name = command_token[1:].split("@", 1)[0].casefold()
+
+    if command_name in {"venue", "create_venue"}:
+        if update.effective_chat is None:
+            return
+        await start_create_venue_flow(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            tournament_id=None,
+        )
+        return
+
+    if command_name == "date":
+        await request_representative_date(update, context)
+        return
+
+    if command_name == "role":
+        await choose_role(update, context)
+        return
+
+    await update.message.reply_text(
+        "Команда не распознана. Доступно: /start, /login, /role, /date, /venue, /poll, /cancel.",
+        reply_markup=hide_main_keyboard(),
+    )
+
+
 def ensure_db_path(db_path: Path) -> Path:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     legacy_db_path = Path("/opt/render/project/src/bot.db")
@@ -1148,6 +1184,7 @@ def main() -> None:
     application.add_handler(CommandHandler("poll", poll_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.COMMAND, handle_unmatched_command))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
