@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import os
 import shutil
@@ -12,8 +13,7 @@ from typing import Any
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.ext import (
@@ -33,30 +33,42 @@ ROLE_LABELS: dict[str, str] = {
     "player": "игрок",
     "captain": "капитан",
     "representative": "представитель",
-    "organizer": "организатор",
-    "editor": "редактор",
-    "tester": "тестер",
 }
 
-MENU_LOGIN = "Авторизоваться"
-MENU_ROLE = "Выбрать роль"
-MENU_SYNC = "Показать синхроны"
-MENU_POLL = "Создать опрос"
-MENU_LOGOUT = "Выйти"
+MENU_LOGIN = "авторизоваться"
+MENU_ROLE = "выбрать роль"
+MENU_SYNC = "показать синхроны"
+MENU_POLL = "создать опрос"
+MENU_LOGOUT = "выйти"
 
 POLL_OPTION_ANY = "Буду играть любой"
 POLL_OPTION_NONE = "Не буду играть ни один"
 
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
-PENDING_ORGANIZER_DATE = "organizer_date"
+PENDING_REPRESENTATIVE_DATE = "representative_date"
 
 DATE_PICKER_DAYS = 21
 DATE_CALLBACK_IGNORE = "date:ignore"
 DATE_CALLBACK_MANUAL = "date:manual"
 DATE_CALLBACK_PICK_PREFIX = "date:pick:"
+DATE_CALLBACK_MONTH_PREFIX = "date:month:"
 
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+MONTH_LABELS = (
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+)
 
 
 @dataclass(slots=True)
@@ -84,15 +96,8 @@ def get_rating_api(context: ContextTypes.DEFAULT_TYPE) -> RatingApiClient:
     return context.application.bot_data["rating_api"]
 
 
-def build_main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(MENU_LOGIN), KeyboardButton(MENU_ROLE)],
-            [KeyboardButton(MENU_SYNC), KeyboardButton(MENU_POLL)],
-            [KeyboardButton(MENU_LOGOUT)],
-        ],
-        resize_keyboard=True,
-    )
+def hide_main_keyboard() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove(remove_keyboard=True)
 
 
 def tournament_markup(tournament_id: int, selected: bool) -> InlineKeyboardMarkup:
@@ -118,35 +123,69 @@ def build_role_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def build_date_picker_markup(*, window_days: int = DATE_PICKER_DAYS) -> InlineKeyboardMarkup:
+def _shift_month(base: date, month_offset: int) -> date:
+    month_index = (base.month - 1) + month_offset
+    year = base.year + (month_index // 12)
+    month = (month_index % 12) + 1
+    return date(year, month, 1)
+
+
+def build_date_picker_markup(
+    *,
+    window_days: int = DATE_PICKER_DAYS,
+    month_offset: int = 0,
+) -> InlineKeyboardMarkup:
     today = date.today()
     end_day = today + timedelta(days=window_days - 1)
-    calendar_start = today - timedelta(days=today.weekday())
-    calendar_end = end_day + timedelta(days=(6 - end_day.weekday()))
+    first_month = date(today.year, today.month, 1)
+    last_month = date(end_day.year, end_day.month, 1)
+
+    max_offset = (last_month.year - first_month.year) * 12 + (last_month.month - first_month.month)
+    month_offset = max(0, min(month_offset, max_offset))
+
+    shown_month = _shift_month(first_month, month_offset)
+    month_name = f"{MONTH_LABELS[shown_month.month - 1]} {shown_month.year}"
+
+    prev_button = InlineKeyboardButton("◀", callback_data=DATE_CALLBACK_IGNORE)
+    if month_offset > 0:
+        prev_button = InlineKeyboardButton(
+            "◀", callback_data=f"{DATE_CALLBACK_MONTH_PREFIX}{month_offset - 1}"
+        )
+
+    next_button = InlineKeyboardButton("▶", callback_data=DATE_CALLBACK_IGNORE)
+    if month_offset < max_offset:
+        next_button = InlineKeyboardButton(
+            "▶", callback_data=f"{DATE_CALLBACK_MONTH_PREFIX}{month_offset + 1}"
+        )
 
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS]
+        [
+            prev_button,
+            InlineKeyboardButton(month_name, callback_data=DATE_CALLBACK_IGNORE),
+            next_button,
+        ],
+        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS],
     ]
 
-    cursor = calendar_start
-    while cursor <= calendar_end:
+    for week in calendar.Calendar(firstweekday=0).monthdatescalendar(shown_month.year, shown_month.month):
         week_row: list[InlineKeyboardButton] = []
-        for _ in range(7):
-            if today <= cursor <= end_day:
-                label = str(cursor.day)
-                if cursor == today:
-                    label = f"•{cursor.day}"
+        for day in week:
+            if day.month != shown_month.month:
+                week_row.append(InlineKeyboardButton(" ", callback_data=DATE_CALLBACK_IGNORE))
+                continue
+
+            if today <= day <= end_day:
+                label = str(day.day)
+                if day == today:
+                    label = f"•{day.day}"
                 week_row.append(
                     InlineKeyboardButton(
                         label,
-                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{cursor.isoformat()}",
+                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{day.isoformat()}",
                     )
                 )
             else:
-                week_row.append(
-                    InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE)
-                )
-            cursor += timedelta(days=1)
+                week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
         rows.append(week_row)
 
     rows.append(
@@ -206,10 +245,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Бот для rating.chgk.info готов.\n"
-        "1) Нажмите «Авторизоваться»\n"
-        "2) Выберите роль\n"
-        "3) Для роли организатора нажмите «Показать синхроны»",
-        reply_markup=build_main_keyboard(),
+        "1) Введите /login\n"
+        "2) Введите /role\n"
+        "3) Для роли «представитель» нажмите /date\n"
+        "4) После выбора турниров нажмите /poll",
+        reply_markup=hide_main_keyboard(),
     )
 
 
@@ -221,7 +261,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state.pending_action = None
     state.temp_email = None
 
-    await update.message.reply_text("Текущее действие отменено.", reply_markup=build_main_keyboard())
+    await update.message.reply_text("Текущее действие отменено.", reply_markup=hide_main_keyboard())
 
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,7 +274,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Введите email от rating.chgk.info.",
-        reply_markup=build_main_keyboard(),
+        reply_markup=hide_main_keyboard(),
     )
 
 
@@ -249,7 +289,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state.pending_action = None
     state.temp_email = None
 
-    await update.message.reply_text("Сессия rating очищена.", reply_markup=build_main_keyboard())
+    await update.message.reply_text("Сессия rating очищена.", reply_markup=hide_main_keyboard())
 
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,17 +302,17 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def request_organizer_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def request_representative_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
 
     storage = get_storage(context)
     persisted = storage.get_user_state(update.effective_user.id)
 
-    if persisted.role != "organizer":
+    if persisted.role != "representative":
         await update.message.reply_text(
-            "Эта функция доступна для роли «организатор». Сначала выберите роль.",
-            reply_markup=build_main_keyboard(),
+            "Эта функция доступна для роли «представитель». Сначала выберите роль.",
+            reply_markup=hide_main_keyboard(),
         )
         return
 
@@ -319,7 +359,7 @@ async def send_tournaments_for_date(
         await context.bot.send_message(
             chat_id=chat_id,
             text="Синхроны на эту дату не найдены.",
-            reply_markup=build_main_keyboard(),
+            reply_markup=hide_main_keyboard(),
         )
         return
 
@@ -493,9 +533,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         return
 
+    if data.startswith(DATE_CALLBACK_MONTH_PREFIX):
+        raw_offset = data.removeprefix(DATE_CALLBACK_MONTH_PREFIX)
+        if not raw_offset.isdigit():
+            await query.answer()
+            return
+
+        month_offset = int(raw_offset)
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_date_picker_markup(month_offset=month_offset)
+            )
+        except Exception:
+            pass
+        return
+
     if data == DATE_CALLBACK_MANUAL:
         state = get_runtime_state(context, user_id)
-        state.pending_action = PENDING_ORGANIZER_DATE
+        state.pending_action = PENDING_REPRESENTATIVE_DATE
         await query.answer()
         await query.edit_message_text(
             "Введите дату в формате YYYY-MM-DD (например, 2026-03-10)."
@@ -509,8 +565,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         storage = get_storage(context)
         persisted = storage.get_user_state(user_id)
-        if persisted.role != "organizer":
-            await query.answer("Сначала выберите роль «организатор».", show_alert=True)
+        if persisted.role != "representative":
+            await query.answer("Сначала выберите роль «представитель».", show_alert=True)
             return
 
         raw_date = data.removeprefix(DATE_CALLBACK_PICK_PREFIX)
@@ -540,7 +596,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"Не удалось получить турниры: {exc}",
-                reply_markup=build_main_keyboard(),
+                reply_markup=hide_main_keyboard(),
             )
         return
 
@@ -552,24 +608,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     text = (update.message.text or "").strip()
+    text_normalized = text.casefold()
     user_id = update.effective_user.id
     state = get_runtime_state(context, user_id)
 
-    if text == MENU_LOGIN:
+    if text_normalized == MENU_LOGIN:
         await login(update, context)
         return
-    if text == MENU_ROLE:
+    if text_normalized == MENU_ROLE:
         await choose_role(update, context)
         return
-    if text == MENU_SYNC:
-        await request_organizer_date(update, context)
+    if text_normalized == MENU_SYNC:
+        await request_representative_date(update, context)
         return
-    if text == MENU_POLL:
+    if text_normalized == MENU_POLL:
         if update.effective_chat is None:
             return
         await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
         return
-    if text == MENU_LOGOUT:
+    if text_normalized == MENU_LOGOUT:
         await logout(update, context)
         return
 
@@ -615,11 +672,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"Авторизация успешна.{suffix}",
-            reply_markup=build_main_keyboard(),
+            reply_markup=hide_main_keyboard(),
         )
         return
 
-    if state.pending_action == PENDING_ORGANIZER_DATE:
+    if state.pending_action == PENDING_REPRESENTATIVE_DATE:
         try:
             target_date = date.fromisoformat(text)
         except ValueError:
@@ -638,8 +695,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await update.message.reply_text(
-        "Не понял команду. Используйте кнопки меню или /start.",
-        reply_markup=build_main_keyboard(),
+        "Не понял команду. Используйте /start или команды /login, /role, /date, /poll.",
+        reply_markup=hide_main_keyboard(),
     )
 
 
@@ -687,7 +744,7 @@ def main() -> None:
     application.add_handler(CommandHandler("login", login))
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("role", choose_role))
-    application.add_handler(CommandHandler("date", request_organizer_date))
+    application.add_handler(CommandHandler("date", request_representative_date))
     application.add_handler(CommandHandler("poll", poll_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
