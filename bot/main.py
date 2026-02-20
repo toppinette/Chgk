@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import calendar
 import logging
 import os
 import shutil
@@ -52,23 +51,8 @@ DATE_PICKER_DAYS = 21
 DATE_CALLBACK_IGNORE = "date:ignore"
 DATE_CALLBACK_MANUAL = "date:manual"
 DATE_CALLBACK_PICK_PREFIX = "date:pick:"
-DATE_CALLBACK_MONTH_PREFIX = "date:month:"
 
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
-MONTH_LABELS = (
-    "Январь",
-    "Февраль",
-    "Март",
-    "Апрель",
-    "Май",
-    "Июнь",
-    "Июль",
-    "Август",
-    "Сентябрь",
-    "Октябрь",
-    "Ноябрь",
-    "Декабрь",
-)
 
 
 @dataclass(slots=True)
@@ -123,69 +107,42 @@ def build_role_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def _shift_month(base: date, month_offset: int) -> date:
-    month_index = (base.month - 1) + month_offset
-    year = base.year + (month_index // 12)
-    month = (month_index % 12) + 1
-    return date(year, month, 1)
+def get_date_picker_end(window_days: int = DATE_PICKER_DAYS) -> date:
+    today = date.today()
+    end_day = today + timedelta(days=window_days - 1)
+    # Fill the last row fully to Sunday so there are no trailing placeholder dots.
+    return end_day + timedelta(days=(6 - end_day.weekday()))
 
 
 def build_date_picker_markup(
     *,
     window_days: int = DATE_PICKER_DAYS,
-    month_offset: int = 0,
 ) -> InlineKeyboardMarkup:
     today = date.today()
-    end_day = today + timedelta(days=window_days - 1)
-    first_month = date(today.year, today.month, 1)
-    last_month = date(end_day.year, end_day.month, 1)
-
-    max_offset = (last_month.year - first_month.year) * 12 + (last_month.month - first_month.month)
-    month_offset = max(0, min(month_offset, max_offset))
-
-    shown_month = _shift_month(first_month, month_offset)
-    month_name = f"{MONTH_LABELS[shown_month.month - 1]} {shown_month.year}"
-
-    prev_button = InlineKeyboardButton("◀", callback_data=DATE_CALLBACK_IGNORE)
-    if month_offset > 0:
-        prev_button = InlineKeyboardButton(
-            "◀", callback_data=f"{DATE_CALLBACK_MONTH_PREFIX}{month_offset - 1}"
-        )
-
-    next_button = InlineKeyboardButton("▶", callback_data=DATE_CALLBACK_IGNORE)
-    if month_offset < max_offset:
-        next_button = InlineKeyboardButton(
-            "▶", callback_data=f"{DATE_CALLBACK_MONTH_PREFIX}{month_offset + 1}"
-        )
+    calendar_end = get_date_picker_end(window_days)
+    calendar_start = today - timedelta(days=today.weekday())
 
     rows: list[list[InlineKeyboardButton]] = [
-        [
-            prev_button,
-            InlineKeyboardButton(month_name, callback_data=DATE_CALLBACK_IGNORE),
-            next_button,
-        ],
-        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS],
+        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS]
     ]
 
-    for week in calendar.Calendar(firstweekday=0).monthdatescalendar(shown_month.year, shown_month.month):
+    cursor = calendar_start
+    while cursor <= calendar_end:
         week_row: list[InlineKeyboardButton] = []
-        for day in week:
-            if day.month != shown_month.month:
-                week_row.append(InlineKeyboardButton(" ", callback_data=DATE_CALLBACK_IGNORE))
-                continue
-
-            if today <= day <= end_day:
-                label = str(day.day)
-                if day == today:
-                    label = f"•{day.day}"
+        for _ in range(7):
+            if cursor < today:
+                week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
+            else:
+                label = str(cursor.day)
+                if cursor == today:
+                    label = f"•{cursor.day}"
                 week_row.append(
                     InlineKeyboardButton(
                         label,
-                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{day.isoformat()}",
+                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{cursor.isoformat()}",
                     )
                 )
-            else:
-                week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
+            cursor += timedelta(days=1)
         rows.append(week_row)
 
     rows.append(
@@ -320,7 +277,7 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     state.pending_action = None
 
     today = date.today()
-    end_day = today + timedelta(days=DATE_PICKER_DAYS - 1)
+    end_day = get_date_picker_end(DATE_PICKER_DAYS)
     await update.message.reply_text(
         (
             "Выберите дату для синхронов.\n"
@@ -531,22 +488,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == DATE_CALLBACK_IGNORE:
         await query.answer()
-        return
-
-    if data.startswith(DATE_CALLBACK_MONTH_PREFIX):
-        raw_offset = data.removeprefix(DATE_CALLBACK_MONTH_PREFIX)
-        if not raw_offset.isdigit():
-            await query.answer()
-            return
-
-        month_offset = int(raw_offset)
-        await query.answer()
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=build_date_picker_markup(month_offset=month_offset)
-            )
-        except Exception:
-            pass
         return
 
     if data == DATE_CALLBACK_MANUAL:
