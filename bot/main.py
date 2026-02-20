@@ -24,13 +24,7 @@ from telegram.ext import (
     filters,
 )
 
-from .rating_api import (
-    RatingApiClient,
-    RatingApiError,
-    TournamentSummary,
-    TownSummary,
-    VenueTypeSummary,
-)
+from .rating_api import RatingApiClient, RatingApiError, TournamentSummary
 from .storage import BotStorage
 
 
@@ -44,7 +38,6 @@ MENU_LOGIN = "авторизоваться"
 MENU_ROLE = "выбрать роль"
 MENU_SYNC = "показать синхроны"
 MENU_POLL = "создать опрос"
-MENU_CREATE_VENUE = "создать площадку"
 MENU_LOGOUT = "выйти"
 
 POLL_OPTION_ANY = "Буду играть любой"
@@ -53,11 +46,6 @@ POLL_OPTION_NONE = "Не буду играть ни один"
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
 PENDING_REPRESENTATIVE_DATE = "representative_date"
-PENDING_VENUE_TOWN = "venue_town"
-PENDING_VENUE_NAME = "venue_name"
-PENDING_VENUE_TYPE = "venue_type"
-PENDING_VENUE_ADDRESS = "venue_address"
-PENDING_VENUE_URLS = "venue_urls"
 
 DATE_PICKER_DAYS = 21
 DATE_CALLBACK_IGNORE = "date:ignore"
@@ -65,27 +53,6 @@ DATE_CALLBACK_MANUAL = "date:manual"
 DATE_CALLBACK_PICK_PREFIX = "date:pick:"
 
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
-
-VENUE_CALLBACK_START_PREFIX = "venue:start:"
-VENUE_CALLBACK_TOWN_PREFIX = "venue:town:"
-VENUE_CALLBACK_TOWN_RETRY = "venue:town:retry"
-VENUE_CALLBACK_TYPE_PREFIX = "venue:type:"
-VENUE_CALLBACK_SUBMIT = "venue:submit"
-VENUE_CALLBACK_CANCEL = "venue:cancel"
-
-SKIP_MARKERS = {"-", "нет", "пропустить"}
-
-
-@dataclass(slots=True)
-class VenueDraft:
-    tournament_id: int | None = None
-    town_id: int | None = None
-    town_name: str | None = None
-    venue_name: str | None = None
-    venue_type_id: int | None = None
-    venue_type_name: str | None = None
-    address: str | None = None
-    urls: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -96,9 +63,6 @@ class RuntimeState:
     tournaments: dict[int, TournamentSummary] = field(default_factory=dict)
     tournament_order: list[int] = field(default_factory=list)
     selected_tournament_ids: set[int] = field(default_factory=set)
-    venue_draft: VenueDraft | None = None
-    town_candidates: dict[int, TownSummary] = field(default_factory=dict)
-    venue_type_candidates: dict[int, VenueTypeSummary] = field(default_factory=dict)
 
 
 def get_runtime_state(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> RuntimeState:
@@ -123,15 +87,7 @@ def hide_main_keyboard() -> ReplyKeyboardRemove:
 def tournament_markup(tournament_id: int, selected: bool) -> InlineKeyboardMarkup:
     text = "✅ В голосовании" if selected else "➕ Добавить в голосование"
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(text=text, callback_data=f"vote:{tournament_id}"),
-                InlineKeyboardButton(
-                    text="🏟 Создать площадку",
-                    callback_data=f"{VENUE_CALLBACK_START_PREFIX}{tournament_id}",
-                ),
-            ]
-        ]
+        [[InlineKeyboardButton(text=text, callback_data=f"vote:{tournament_id}")]]
     )
 
 
@@ -237,116 +193,19 @@ def truncate_option(text: str, max_len: int = 100) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
-def reset_venue_draft(state: RuntimeState) -> None:
-    state.pending_action = None
-    state.venue_draft = None
-    state.town_candidates.clear()
-    state.venue_type_candidates.clear()
-
-
-def format_town_label(town: TownSummary) -> str:
-    location_parts = [item for item in (town.region_name, town.country_name) if item]
-    if not location_parts:
-        return town.name
-    location = ", ".join(location_parts)
-    return f"{town.name} ({location})"
-
-
-def build_town_markup(candidates: list[TownSummary]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for town in candidates:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=truncate_option(format_town_label(town), 60),
-                    callback_data=f"{VENUE_CALLBACK_TOWN_PREFIX}{town.id}",
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton("🔁 Другой поиск", callback_data=VENUE_CALLBACK_TOWN_RETRY)])
-    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data=VENUE_CALLBACK_CANCEL)])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_venue_types_markup(venue_types: list[VenueTypeSummary]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-
-    for venue_type in venue_types:
-        row.append(
-            InlineKeyboardButton(
-                text=truncate_option(venue_type.name, 28),
-                callback_data=f"{VENUE_CALLBACK_TYPE_PREFIX}{venue_type.id}",
-            )
-        )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-
-    if row:
-        rows.append(row)
-
-    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data=VENUE_CALLBACK_CANCEL)])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_venue_submit_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Создать площадку", callback_data=VENUE_CALLBACK_SUBMIT),
-                InlineKeyboardButton("✖️ Отмена", callback_data=VENUE_CALLBACK_CANCEL),
-            ]
-        ]
-    )
-
-
-def format_venue_draft_summary(draft: VenueDraft) -> str:
-    address = draft.address or "не указан"
-    urls = ", ".join(draft.urls) if draft.urls else "не указаны"
-    town = draft.town_name or "не выбран"
-    venue_type = draft.venue_type_name or "не выбран"
-    venue_name = draft.venue_name or "не указано"
-
-    return (
-        "Проверьте данные площадки:\n"
-        f"Город: {town}\n"
-        f"Название: {venue_name}\n"
-        f"Тип: {venue_type}\n"
-        f"Адрес: {address}\n"
-        f"Ссылки: {urls}"
-    )
-
-
-def get_callback_chat_id(update: Update, query: Any) -> int | None:
-    message = getattr(query, "message", None)
-    chat = getattr(message, "chat", None)
-    if chat is not None and getattr(chat, "id", None) is not None:
-        return int(chat.id)
-
-    if update.effective_chat is not None:
-        return int(update.effective_chat.id)
-
-    return None
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
 
     runtime_state = get_runtime_state(context, update.effective_user.id)
     runtime_state.pending_action = None
-    runtime_state.venue_draft = None
-    runtime_state.town_candidates.clear()
-    runtime_state.venue_type_candidates.clear()
 
     await update.message.reply_text(
         "Бот для rating.chgk.info готов.\n"
         "1) Введите /login\n"
         "2) Введите /role\n"
         "3) Для роли «представитель» нажмите /date\n"
-        "4) Для создания площадки нажмите /venue\n"
-        "5) После выбора турниров нажмите /poll",
+        "4) После выбора турниров нажмите /poll",
         reply_markup=hide_main_keyboard(),
     )
 
@@ -358,9 +217,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_runtime_state(context, update.effective_user.id)
     state.pending_action = None
     state.temp_email = None
-    state.venue_draft = None
-    state.town_candidates.clear()
-    state.venue_type_candidates.clear()
 
     await update.message.reply_text("Текущее действие отменено.", reply_markup=hide_main_keyboard())
 
@@ -389,9 +245,6 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_runtime_state(context, update.effective_user.id)
     state.pending_action = None
     state.temp_email = None
-    state.venue_draft = None
-    state.town_candidates.clear()
-    state.venue_type_candidates.clear()
 
     await update.message.reply_text("Сессия rating очищена.", reply_markup=hide_main_keyboard())
 
@@ -431,68 +284,6 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
             f"Ближайший диапазон: {today.isoformat()} — {end_day.isoformat()}."
         ),
         reply_markup=build_date_picker_markup(),
-    )
-
-
-async def start_create_venue_flow(
-    *,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    user_id: int,
-    tournament_id: int | None = None,
-) -> None:
-    try:
-        storage = get_storage(context)
-        persisted = storage.get_user_state(user_id)
-
-        if persisted.role != "representative":
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Создание площадки доступно для роли «представитель». Сначала выберите роль.",
-                reply_markup=hide_main_keyboard(),
-            )
-            return
-
-        if not persisted.rating_token:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Сначала авторизуйтесь через /login, чтобы создавать площадки.",
-                reply_markup=hide_main_keyboard(),
-            )
-            return
-
-        state = get_runtime_state(context, user_id)
-        state.pending_action = PENDING_VENUE_TOWN
-        state.venue_draft = VenueDraft(tournament_id=tournament_id)
-        state.town_candidates.clear()
-        state.venue_type_candidates.clear()
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "Создание площадки.\n"
-                "Шаг 1/5: введите город (например, Москва)."
-            ),
-            reply_markup=hide_main_keyboard(),
-        )
-    except Exception as exc:
-        logging.exception("Failed to start venue flow for user=%s", user_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Не удалось запустить создание площадки: {exc}",
-            reply_markup=hide_main_keyboard(),
-        )
-
-
-async def create_venue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None or update.effective_user is None:
-        return
-
-    await start_create_venue_flow(
-        context=context,
-        chat_id=update.effective_chat.id,
-        user_id=update.effective_user.id,
-        tournament_id=None,
     )
 
 
@@ -540,9 +331,8 @@ async def send_tournaments_for_date(
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "Готово. Выберите турниры кнопками «Добавить в голосование».\n"
-            "Для площадки используйте «Создать площадку» на карточке турнира.\n"
-            "Когда будете готовы, нажмите «Создать опрос»."
+            "Готово. Выберите турниры кнопками «Добавить в голосование», "
+            "затем нажмите «Создать опрос»."
         ),
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🗳 Создать опрос", callback_data="poll:create")]]
@@ -644,8 +434,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     data = query.data or ""
     user_id = update.effective_user.id
-    state = get_runtime_state(context, user_id)
-    callback_chat_id = get_callback_chat_id(update, query)
 
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
@@ -658,21 +446,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.answer()
         await query.edit_message_text(f"Роль установлена: {ROLE_LABELS[role]}.")
-        if role == "representative" and callback_chat_id is not None:
-            await context.bot.send_message(
-                chat_id=callback_chat_id,
-                text="Новая функция: создание площадки.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🏟 Создать площадку",
-                                callback_data=f"{VENUE_CALLBACK_START_PREFIX}0",
-                            )
-                        ]
-                    ]
-                ),
-            )
         return
 
     if data.startswith("vote:"):
@@ -681,17 +454,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         tournament_id = int(raw_id)
-        tournament = state.tournaments.get(tournament_id)
+        runtime_state = get_runtime_state(context, user_id)
+        tournament = runtime_state.tournaments.get(tournament_id)
 
         if tournament is None:
             await query.answer("Сначала загрузите список турниров по дате.", show_alert=True)
             return
 
-        if tournament_id in state.selected_tournament_ids:
-            state.selected_tournament_ids.remove(tournament_id)
+        if tournament_id in runtime_state.selected_tournament_ids:
+            runtime_state.selected_tournament_ids.remove(tournament_id)
             selected_now = False
         else:
-            state.selected_tournament_ids.add(tournament_id)
+            runtime_state.selected_tournament_ids.add(tournament_id)
             selected_now = True
 
         await query.edit_message_reply_markup(
@@ -699,173 +473,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
         await query.answer(
-            f"Выбрано турниров: {len(state.selected_tournament_ids)}",
+            f"Выбрано турниров: {len(runtime_state.selected_tournament_ids)}",
             show_alert=False,
         )
         return
 
-    if data.startswith(VENUE_CALLBACK_START_PREFIX):
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
-            return
-
-        raw_id = data.removeprefix(VENUE_CALLBACK_START_PREFIX)
-        tournament_id = int(raw_id) if raw_id.isdigit() else None
-        await query.answer()
-        await start_create_venue_flow(
-            context=context,
-            chat_id=callback_chat_id,
-            user_id=user_id,
-            tournament_id=tournament_id,
-        )
-        return
-
-    if data == VENUE_CALLBACK_TOWN_RETRY:
-        state.pending_action = PENDING_VENUE_TOWN
-        state.town_candidates.clear()
-        await query.answer()
-        await query.edit_message_text("Введите город заново (например, Москва).")
-        return
-
-    if data.startswith(VENUE_CALLBACK_TOWN_PREFIX):
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
-            return
-
-        raw_id = data.removeprefix(VENUE_CALLBACK_TOWN_PREFIX)
-        if not raw_id.isdigit():
-            await query.answer("Некорректный город.", show_alert=True)
-            return
-
-        if state.pending_action != PENDING_VENUE_TOWN or state.venue_draft is None:
-            await query.answer("Сначала начните создание площадки.", show_alert=True)
-            return
-
-        town_id = int(raw_id)
-        town = state.town_candidates.get(town_id)
-        if town is None:
-            await query.answer("Город не найден в текущем списке.", show_alert=True)
-            return
-
-        state.venue_draft.town_id = town.id
-        state.venue_draft.town_name = town.name
-        state.pending_action = PENDING_VENUE_NAME
-        await query.answer(f"Город: {town.name}")
-        await query.edit_message_text(f"Город выбран: {format_town_label(town)}")
-        await context.bot.send_message(
-            chat_id=callback_chat_id,
-            text="Шаг 2/5: введите название площадки.",
-            reply_markup=hide_main_keyboard(),
-        )
-        return
-
-    if data.startswith(VENUE_CALLBACK_TYPE_PREFIX):
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
-            return
-
-        raw_id = data.removeprefix(VENUE_CALLBACK_TYPE_PREFIX)
-        if not raw_id.isdigit():
-            await query.answer("Некорректный тип площадки.", show_alert=True)
-            return
-
-        if state.pending_action != PENDING_VENUE_TYPE or state.venue_draft is None:
-            await query.answer("Сначала введите название площадки.", show_alert=True)
-            return
-
-        venue_type_id = int(raw_id)
-        venue_type = state.venue_type_candidates.get(venue_type_id)
-        if venue_type is None:
-            await query.answer("Тип не найден в текущем списке.", show_alert=True)
-            return
-
-        state.venue_draft.venue_type_id = venue_type.id
-        state.venue_draft.venue_type_name = venue_type.name
-        state.pending_action = PENDING_VENUE_ADDRESS
-        await query.answer(f"Тип: {venue_type.name}")
-        await query.edit_message_text(f"Тип площадки: {venue_type.name}")
-        await context.bot.send_message(
-            chat_id=callback_chat_id,
-            text="Шаг 4/5: введите адрес площадки или «-», чтобы пропустить.",
-            reply_markup=hide_main_keyboard(),
-        )
-        return
-
-    if data == VENUE_CALLBACK_CANCEL:
-        reset_venue_draft(state)
-        await query.answer("Отменено")
-        await query.edit_message_text("Создание площадки отменено.")
-        return
-
-    if data == VENUE_CALLBACK_SUBMIT:
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
-            return
-
-        draft = state.venue_draft
-        if (
-            draft is None
-            or draft.town_id is None
-            or draft.town_name is None
-            or not draft.venue_name
-            or draft.venue_type_id is None
-            or draft.venue_type_name is None
-        ):
-            await query.answer("Данные площадки не заполнены.", show_alert=True)
-            return
-
-        storage = get_storage(context)
-        persisted = storage.get_user_state(user_id)
-        if not persisted.rating_token:
-            await query.answer("Сначала авторизуйтесь через /login.", show_alert=True)
-            return
-
-        api = get_rating_api(context)
-        await query.answer()
-        try:
-            created = await api.create_venue(
-                name=draft.venue_name,
-                town_id=draft.town_id,
-                town_name=draft.town_name,
-                venue_type_id=draft.venue_type_id,
-                venue_type_name=draft.venue_type_name,
-                address=draft.address,
-                urls=draft.urls,
-                bearer_token=persisted.rating_token,
-            )
-        except RatingApiError as exc:
-            await context.bot.send_message(
-                chat_id=callback_chat_id,
-                text=f"Не удалось создать площадку: {exc}",
-                reply_markup=hide_main_keyboard(),
-            )
-            return
-
-        venue_id = created.get("id") if isinstance(created, dict) else None
-        venue_name = created.get("name") if isinstance(created, dict) else None
-        venue_name_label = venue_name if isinstance(venue_name, str) and venue_name else draft.venue_name
-
-        reset_venue_draft(state)
-
-        try:
-            await query.edit_message_text("Площадка успешно создана в rating API.")
-        except Exception:
-            pass
-
-        suffix = f" (ID {venue_id})" if isinstance(venue_id, int) else ""
-        await context.bot.send_message(
-            chat_id=callback_chat_id,
-            text=f"Создана площадка: {venue_name_label}{suffix}",
-            reply_markup=hide_main_keyboard(),
-        )
-        return
-
     if data == "poll:create":
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
+        if update.effective_chat is None:
+            await query.answer()
             return
         await query.answer()
-        await create_poll(context=context, chat_id=callback_chat_id, user_id=user_id)
+        await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
         return
 
     if data == DATE_CALLBACK_IGNORE:
@@ -882,8 +500,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(DATE_CALLBACK_PICK_PREFIX):
-        if callback_chat_id is None:
-            await query.answer("Не удалось определить чат.", show_alert=True)
+        if update.effective_chat is None:
+            await query.answer()
             return
 
         storage = get_storage(context)
@@ -905,18 +523,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception:
             pass
 
+        state = get_runtime_state(context, user_id)
         state.pending_action = None
 
         try:
             await send_tournaments_for_date(
                 context=context,
-                chat_id=callback_chat_id,
+                chat_id=update.effective_chat.id,
                 user_id=user_id,
                 target_date=target_date,
             )
         except RatingApiError as exc:
             await context.bot.send_message(
-                chat_id=callback_chat_id,
+                chat_id=update.effective_chat.id,
                 text=f"Не удалось получить турниры: {exc}",
                 reply_markup=hide_main_keyboard(),
             )
@@ -947,16 +566,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if update.effective_chat is None:
             return
         await create_poll(context=context, chat_id=update.effective_chat.id, user_id=user_id)
-        return
-    if text_normalized == MENU_CREATE_VENUE:
-        if update.effective_chat is None:
-            return
-        await start_create_venue_flow(
-            context=context,
-            chat_id=update.effective_chat.id,
-            user_id=user_id,
-            tournament_id=None,
-        )
         return
     if text_normalized == MENU_LOGOUT:
         await logout(update, context)
@@ -1026,138 +635,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(f"Не удалось получить турниры: {exc}")
         return
 
-    if state.pending_action == PENDING_VENUE_TOWN:
-        if len(text) < 2:
-            await update.message.reply_text("Введите хотя бы 2 символа названия города.")
-            return
-
-        api = get_rating_api(context)
-        try:
-            towns = await api.search_towns(text, page_size=10)
-        except RatingApiError as exc:
-            await update.message.reply_text(f"Не удалось найти города: {exc}")
-            return
-
-        if not towns:
-            await update.message.reply_text(
-                "Города не найдены. Уточните запрос и отправьте снова."
-            )
-            return
-
-        state.town_candidates = {town.id: town for town in towns}
-        await update.message.reply_text(
-            "Шаг 1/5: выберите город из списка:",
-            reply_markup=build_town_markup(towns),
-        )
-        return
-
-    if state.pending_action == PENDING_VENUE_NAME:
-        if state.venue_draft is None or state.venue_draft.town_id is None:
-            await update.message.reply_text("Сначала выберите город.")
-            state.pending_action = PENDING_VENUE_TOWN
-            return
-
-        venue_name = text.strip()
-        if len(venue_name) < 3:
-            await update.message.reply_text("Название площадки должно быть не короче 3 символов.")
-            return
-
-        state.venue_draft.venue_name = venue_name
-
-        api = get_rating_api(context)
-        try:
-            venue_types = await api.get_venue_types()
-        except RatingApiError as exc:
-            await update.message.reply_text(f"Не удалось получить типы площадок: {exc}")
-            return
-
-        state.pending_action = PENDING_VENUE_TYPE
-        state.venue_type_candidates = {item.id: item for item in venue_types}
-        await update.message.reply_text(
-            "Шаг 3/5: выберите тип площадки:",
-            reply_markup=build_venue_types_markup(venue_types),
-        )
-        return
-
-    if state.pending_action == PENDING_VENUE_ADDRESS:
-        if state.venue_draft is None:
-            await update.message.reply_text("Сначала начните создание площадки заново через /venue.")
-            return
-
-        normalized = text.casefold()
-        state.venue_draft.address = None if normalized in SKIP_MARKERS else text
-        state.pending_action = PENDING_VENUE_URLS
-        await update.message.reply_text(
-            "Шаг 5/5: введите ссылки площадки через запятую или «-», чтобы пропустить."
-        )
-        return
-
-    if state.pending_action == PENDING_VENUE_URLS:
-        if state.venue_draft is None:
-            await update.message.reply_text("Сначала начните создание площадки заново через /venue.")
-            return
-
-        normalized = text.casefold()
-        if normalized in SKIP_MARKERS:
-            urls: list[str] = []
-        else:
-            chunks = [item.strip() for item in text.replace("\n", ",").split(",")]
-            urls = [item for item in chunks if item]
-            invalid = [url for url in urls if not (url.startswith("http://") or url.startswith("https://"))]
-            if invalid:
-                await update.message.reply_text(
-                    "Ссылки должны начинаться с http:// или https://. "
-                    "Исправьте и отправьте снова, либо введите «-»."
-                )
-                return
-
-        state.venue_draft.urls = urls
-        state.pending_action = None
-
-        await update.message.reply_text(
-            format_venue_draft_summary(state.venue_draft),
-            reply_markup=build_venue_submit_markup(),
-        )
-        return
-
     await update.message.reply_text(
-        "Не понял команду. Используйте /start или команды /login, /role, /date, /venue, /poll.",
-        reply_markup=hide_main_keyboard(),
-    )
-
-
-async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None or update.effective_user is None:
-        return
-
-    raw_text = (update.message.text or "").strip()
-    if not raw_text.startswith("/"):
-        return
-
-    command_token = raw_text.split(maxsplit=1)[0]
-    command_name = command_token[1:].split("@", 1)[0].casefold()
-
-    if command_name in {"venue", "create_venue"}:
-        if update.effective_chat is None:
-            return
-        await start_create_venue_flow(
-            context=context,
-            chat_id=update.effective_chat.id,
-            user_id=update.effective_user.id,
-            tournament_id=None,
-        )
-        return
-
-    if command_name == "date":
-        await request_representative_date(update, context)
-        return
-
-    if command_name == "role":
-        await choose_role(update, context)
-        return
-
-    await update.message.reply_text(
-        "Команда не распознана. Доступно: /start, /login, /role, /date, /venue, /poll, /cancel.",
+        "Не понял команду. Используйте /start или команды /login, /role, /date, /poll.",
         reply_markup=hide_main_keyboard(),
     )
 
@@ -1207,12 +686,9 @@ def main() -> None:
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("role", choose_role))
     application.add_handler(CommandHandler("date", request_representative_date))
-    application.add_handler(CommandHandler("venue", create_venue_command))
-    application.add_handler(CommandHandler("create_venue", create_venue_command))
     application.add_handler(CommandHandler("poll", poll_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.COMMAND, handle_unmatched_command))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
