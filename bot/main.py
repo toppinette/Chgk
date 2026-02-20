@@ -44,6 +44,9 @@ MENU_SYNC = "Показать синхроны"
 MENU_POLL = "Создать опрос"
 MENU_LOGOUT = "Выйти"
 
+POLL_OPTION_ANY = "Буду играть любой"
+POLL_OPTION_NONE = "Не буду играть ни один"
+
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
 PENDING_ORGANIZER_DATE = "organizer_date"
@@ -351,7 +354,7 @@ async def create_poll(
     if not runtime_state.selected_tournament_ids:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Сначала выберите хотя бы 2 турнира для голосования.",
+            text="Сначала выберите хотя бы 1 турнир для голосования.",
         )
         return
 
@@ -361,17 +364,21 @@ async def create_poll(
         if tournament_id in runtime_state.selected_tournament_ids
     ]
 
-    if len(ordered_selected_ids) < 2:
+    if len(ordered_selected_ids) < 1:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Для опроса нужно минимум 2 варианта.",
+            text="Для опроса нужен хотя бы 1 выбранный турнир.",
         )
         return
 
-    if len(ordered_selected_ids) > 10:
+    # Telegram supports max 10 options. 2 are reserved for fixed answers.
+    if len(ordered_selected_ids) > 8:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Telegram поддерживает максимум 10 вариантов. Уберите лишние турниры.",
+            text=(
+                "Telegram поддерживает максимум 10 вариантов. "
+                "Уберите лишние турниры (можно выбрать не более 8)."
+            ),
         )
         return
 
@@ -390,12 +397,15 @@ async def create_poll(
         seen.add(option)
         options.append(option)
 
-    if len(options) < 2:
+    if len(options) < 1:
         await context.bot.send_message(
             chat_id=chat_id,
             text="Не удалось собрать варианты для опроса. Попробуйте выбрать заново.",
         )
         return
+
+    options.append(POLL_OPTION_ANY)
+    options.append(POLL_OPTION_NONE)
 
     poll_date = runtime_state.selected_date.isoformat() if runtime_state.selected_date else "дата"
     question = f"За какие турниры голосуем? ({poll_date})"
