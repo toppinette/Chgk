@@ -279,6 +279,41 @@ def parse_request_date_start(raw: str) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
+def is_expired_jwt_error(exc: RatingApiError) -> bool:
+    message = str(exc).casefold()
+    return (
+        "expired jwt token" in message
+        or ("jwt" in message and "expired" in message)
+        or ("token" in message and "expired" in message)
+    )
+
+
+async def notify_tournaments_error(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    exc: RatingApiError,
+) -> None:
+    if is_expired_jwt_error(exc):
+        storage = get_storage(context)
+        storage.clear_rating_token(user_id)
+        state = get_runtime_state(context, user_id)
+        state.pending_action = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Сессия истекла. Нажмите «Авторизация» и войдите снова.",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Не удалось получить турниры: {exc}",
+        reply_markup=main_menu_markup(context, user_id),
+    )
+
+
 def get_callback_chat_id(update: Update) -> int | None:
     query = update.callback_query
     if query is not None and query.message is not None and query.message.chat is not None:
@@ -405,6 +440,12 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     if persisted.role != "representative":
         await update.message.reply_text(
             "Эта функция доступна для роли «представитель». Сначала выберите роль.",
+            reply_markup=main_menu_markup(context, update.effective_user.id),
+        )
+        return
+    if not persisted.rating_token:
+        await update.message.reply_text(
+            "Сессия неактивна. Нажмите «Авторизация» и войдите снова.",
             reply_markup=main_menu_markup(context, update.effective_user.id),
         )
         return
@@ -766,10 +807,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 target_date=target_date,
             )
         except RatingApiError as exc:
-            await context.bot.send_message(
+            await notify_tournaments_error(
+                context=context,
                 chat_id=callback_chat_id,
-                text=f"Не удалось получить турниры: {exc}",
-                reply_markup=main_menu_markup(context, user_id),
+                user_id=user_id,
+                exc=exc,
             )
         return
 
@@ -878,7 +920,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 target_date=target_date,
             )
         except RatingApiError as exc:
-            await update.message.reply_text(f"Не удалось получить турниры: {exc}")
+            await notify_tournaments_error(
+                context=context,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                exc=exc,
+            )
         return
 
     if state.pending_action == PENDING_REQUEST_TOURNAMENT:
