@@ -1068,12 +1068,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         rating_site = get_rating_site(context)
+        password = text
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
         await update.message.reply_text("Отправляю заявку на сайт...")
 
         try:
             result = await rating_site.submit_tournament_request(
                 email=persisted.rating_email,
-                password=text,
+                password=password,
                 tournament_id=draft.tournament_id,
                 venue_id=draft.venue_id,
                 date_start=draft.date_start,
@@ -1083,6 +1089,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except RatingSiteError as exc:
             reset_request_draft(state)
+            logging.warning(
+                "Tournament request submit failed for user_id=%s tournament_id=%s: %s",
+                user_id,
+                draft.tournament_id,
+                exc,
+            )
             await update.message.reply_text(f"Не удалось отправить заявку: {exc}")
             return
 

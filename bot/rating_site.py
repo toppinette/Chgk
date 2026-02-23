@@ -44,7 +44,11 @@ class RatingSiteClient:
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         cookie_jar = aiohttp.CookieJar()
 
-        async with aiohttp.ClientSession(timeout=timeout, cookie_jar=cookie_jar) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=cookie_jar,
+            headers=self._build_default_headers(),
+        ) as session:
             await self._login(session, email=email, password=password)
 
             form_url = f"{self.base_url}/tournament/request?tournamentId={tournament_id}"
@@ -115,7 +119,7 @@ class RatingSiteClient:
         ) as response:
             html = await response.text()
             if response.status >= 400:
-                raise RatingSiteError(f"Сайт rating вернул HTTP {response.status}")
+                raise RatingSiteError(self._http_error_message(response.status, str(response.url)))
             return html, str(response.url)
 
     async def _post_form(
@@ -126,6 +130,7 @@ class RatingSiteClient:
         *,
         referer: str,
     ) -> tuple[str, str]:
+        origin = self._origin_from_url(referer)
         async with session.post(
             action_url,
             data=fields,
@@ -133,12 +138,38 @@ class RatingSiteClient:
             headers={
                 "Accept": "text/html,application/xhtml+xml",
                 "Referer": referer,
+                "Origin": origin,
             },
         ) as response:
             html = await response.text()
             if response.status >= 400:
-                raise RatingSiteError(f"Сайт rating вернул HTTP {response.status}")
+                raise RatingSiteError(self._http_error_message(response.status, str(response.url)))
             return html, str(response.url)
+
+    def _build_default_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ru,en;q=0.9",
+        }
+
+    def _origin_from_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return self.base_url
+
+    def _http_error_message(self, status: int, url: str) -> str:
+        path = urlparse(url).path or "/"
+        if status == 403:
+            return (
+                f"Сайт rating вернул HTTP 403 на {path}. "
+                "Обычно это блокировка формы/доступа или anti-bot проверка."
+            )
+        return f"Сайт rating вернул HTTP {status} на {path}"
 
     def _extract_request_form(self, html: str, page_url: str) -> RequestFormData:
         form = self._extract_form(html, page_url, action_suffix="/tournament/request")
