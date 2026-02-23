@@ -119,6 +119,19 @@ class RatingSiteClient:
             if self._contains_login_form(post_html):
                 raise RatingSiteError("Логин на сайте не прошёл. Проверьте email/пароль.")
 
+        # Explicitly verify that session is authenticated; otherwise request page
+        # can fail with a generic 403 "Недостаточно прав", which is misleading.
+        home_html, _ = await self._get_text(
+            session,
+            f"{self.base_url}/",
+            stage="login_check_home",
+        )
+        if self._looks_like_guest_home(home_html):
+            raise RatingSiteError(
+                "Не удалось подтвердить вход на сайт (гостевой режим после логина). "
+                "Проверьте email/пароль."
+            )
+
     async def _get_text(
         self,
         session: aiohttp.ClientSession,
@@ -407,6 +420,14 @@ class RatingSiteClient:
     def _contains_login_form(self, html: str) -> bool:
         soup = BeautifulSoup(html, "html.parser")
         return soup.find("form", attrs={"action": "/login"}) is not None
+
+    def _looks_like_guest_home(self, html: str) -> bool:
+        soup = BeautifulSoup(html, "html.parser")
+        login_link = soup.select_one('a[href="/login"]')
+        if login_link is None:
+            return False
+        text = login_link.get_text(" ", strip=True).casefold()
+        return "вход" in text or "регистрац" in text
 
     def _raise_if_site_error(self, html: str) -> None:
         soup = BeautifulSoup(html, "html.parser")

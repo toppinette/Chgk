@@ -1039,8 +1039,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         state.request_draft.comment = None if text.casefold() in SKIP_MARKERS else text
         state.pending_action = PENDING_REQUEST_PASSWORD
+        storage = get_storage(context)
+        persisted = storage.get_user_state(user_id)
+        email_label = persisted.rating_email or "(не указан)"
         await update.message.reply_text(
-            "Шаг 6/6: введите пароль от rating.chgk.info для отправки заявки."
+            (
+                "Шаг 6/6: введите пароль от rating.chgk.info для отправки заявки.\n"
+                f"Используется email: {email_label}\n"
+                "Если нужен другой аккаунт, сначала выполните «Авторизация»."
+            )
         )
         return
 
@@ -1090,8 +1097,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except RatingSiteError as exc:
             reset_request_draft(state)
             logging.warning(
-                "Tournament request submit failed for user_id=%s tournament_id=%s: %s",
+                "Tournament request submit failed for user_id=%s email=%s tournament_id=%s: %s",
                 user_id,
+                persisted.rating_email,
                 draft.tournament_id,
                 exc,
             )
