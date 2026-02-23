@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
@@ -70,12 +70,12 @@ class RatingSiteClient:
                     comment=comment,
                 )
 
-                submit_html, submit_url = await self._post_form(
-                    session,
-                    form_data.action_url,
-                    form_data.fields,
+                submit_html, submit_url = await self._submit_request_with_fallback(
+                    session=session,
+                    action_url=form_data.action_url,
+                    form_fields=form_data.fields,
                     referer=resolved_form_url,
-                    stage="request_post",
+                    tournament_id=tournament_id,
                 )
 
                 self._raise_if_login_page(submit_url, submit_html)
@@ -89,6 +89,46 @@ class RatingSiteClient:
             raise RatingSiteError(f"Ошибка соединения с сайтом rating: {exc}") from exc
         except TimeoutError as exc:
             raise RatingSiteError("Таймаут при обращении к сайту rating") from exc
+
+    async def _submit_request_with_fallback(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        action_url: str,
+        form_fields: dict[str, str],
+        referer: str,
+        tournament_id: int,
+    ) -> tuple[str, str]:
+        try:
+            return await self._post_form(
+                session,
+                action_url,
+                form_fields,
+                referer=referer,
+                stage="request_post",
+            )
+        except RatingSiteError as exc:
+            message = str(exc)
+            if "[request_post]" not in message or "HTTP 405" not in message:
+                raise
+
+            fallback_url = self._build_request_fallback_url(
+                tournament_id=tournament_id,
+                referer=referer,
+            )
+            return await self._post_form(
+                session,
+                fallback_url,
+                form_fields,
+                referer=referer,
+                stage="request_post_fallback",
+            )
+
+    def _build_request_fallback_url(self, *, tournament_id: int, referer: str) -> str:
+        parsed = urlparse(referer)
+        base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
+        query = urlencode({"tournamentId": tournament_id})
+        return f"{base}/tournament/request?{query}"
 
     async def _login(self, session: aiohttp.ClientSession, *, email: str, password: str) -> None:
         login_url = f"{self.base_url}/login"
