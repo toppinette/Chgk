@@ -52,7 +52,11 @@ class RatingSiteClient:
             await self._login(session, email=email, password=password)
 
             form_url = f"{self.base_url}/tournament/request?tournamentId={tournament_id}"
-            form_html, resolved_form_url = await self._get_text(session, form_url)
+            form_html, resolved_form_url = await self._get_text(
+                session,
+                form_url,
+                stage="request_get",
+            )
 
             form_data = self._extract_request_form(form_html, resolved_form_url)
             self._fill_request_form(
@@ -70,6 +74,7 @@ class RatingSiteClient:
                 form_data.action_url,
                 form_data.fields,
                 referer=resolved_form_url,
+                stage="request_post",
             )
 
             self._raise_if_login_page(submit_url, submit_html)
@@ -82,7 +87,11 @@ class RatingSiteClient:
 
     async def _login(self, session: aiohttp.ClientSession, *, email: str, password: str) -> None:
         login_url = f"{self.base_url}/login"
-        login_html, resolved_login_url = await self._get_text(session, login_url)
+        login_html, resolved_login_url = await self._get_text(
+            session,
+            login_url,
+            stage="login_get",
+        )
         login_form = self._extract_form(login_html, resolved_login_url, action_suffix="/login")
 
         username_field = self._find_field(login_form.fields, ("username", "_username", "email"))
@@ -103,6 +112,7 @@ class RatingSiteClient:
             login_form.action_url,
             login_form.fields,
             referer=resolved_login_url,
+            stage="login_post",
         )
 
         if self._is_login_url(post_url):
@@ -110,7 +120,11 @@ class RatingSiteClient:
                 raise RatingSiteError("Логин на сайте не прошёл. Проверьте email/пароль.")
 
     async def _get_text(
-        self, session: aiohttp.ClientSession, url: str
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        stage: str = "get",
     ) -> tuple[str, str]:
         async with session.get(
             url,
@@ -119,7 +133,13 @@ class RatingSiteClient:
         ) as response:
             html = await response.text()
             if response.status >= 400:
-                raise RatingSiteError(self._http_error_message(response.status, str(response.url)))
+                base = self._http_error_message(response.status, str(response.url))
+                detail = self._extract_error_detail_from_html(html)
+                headers_hint = self._extract_error_headers(response.headers)
+                extra = f"{detail} {headers_hint}".strip()
+                if extra:
+                    raise RatingSiteError(f"[{stage}] {base} {extra}")
+                raise RatingSiteError(f"[{stage}] {base}")
             return html, str(response.url)
 
     async def _post_form(
@@ -129,6 +149,7 @@ class RatingSiteClient:
         fields: dict[str, str],
         *,
         referer: str,
+        stage: str = "post",
     ) -> tuple[str, str]:
         origin = self._origin_from_url(referer)
         async with session.post(
@@ -146,9 +167,10 @@ class RatingSiteClient:
                 base = self._http_error_message(response.status, str(response.url))
                 detail = self._extract_error_detail_from_html(html)
                 headers_hint = self._extract_error_headers(response.headers)
+                prefix = f"[{stage}] "
                 if detail:
-                    raise RatingSiteError(f"{base} {detail} {headers_hint}".strip())
-                raise RatingSiteError(f"{base} {headers_hint}".strip())
+                    raise RatingSiteError(f"{prefix}{base} {detail} {headers_hint}".strip())
+                raise RatingSiteError(f"{prefix}{base} {headers_hint}".strip())
             return html, str(response.url)
 
     def _build_default_headers(self) -> dict[str, str]:
