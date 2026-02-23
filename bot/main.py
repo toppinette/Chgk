@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import os
 import shutil
@@ -70,6 +71,20 @@ REQUEST_CALLBACK_REPRESENTATIVE_DEFAULT = "request:representative:default"
 REQUEST_CALLBACK_REPRESENTATIVE_CUSTOM = "request:representative:custom"
 
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+MONTH_LABELS = (
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+)
 SKIP_MARKERS = {"-", "нет", "пропустить"}
 
 
@@ -196,31 +211,60 @@ def build_date_picker_markup(
 ) -> InlineKeyboardMarkup:
     today = date.today()
     max_selectable = today + timedelta(days=window_days - 1)
-    calendar_end = get_date_picker_end(window_days)
-    calendar_start = today - timedelta(days=today.weekday())
 
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS]
-    ]
+    rows: list[list[InlineKeyboardButton]] = []
 
-    cursor = calendar_start
-    while cursor <= calendar_end:
-        week_row: list[InlineKeyboardButton] = []
-        for _ in range(7):
-            if cursor < today or cursor > max_selectable:
-                week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
-            else:
-                label = str(cursor.day)
-                if cursor == today:
-                    label = f"•{cursor.day}"
-                week_row.append(
-                    InlineKeyboardButton(
-                        label,
-                        callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{cursor.isoformat()}",
-                    )
+    month_cursor = date(today.year, today.month, 1)
+    month_starts: list[date] = []
+    while month_cursor <= max_selectable:
+        month_starts.append(month_cursor)
+        if month_cursor.month == 12:
+            month_cursor = date(month_cursor.year + 1, 1, 1)
+        else:
+            month_cursor = date(month_cursor.year, month_cursor.month + 1, 1)
+
+    for month_index, month_start in enumerate(month_starts):
+        month_days = calendar.monthrange(month_start.year, month_start.month)[1]
+        month_end = date(month_start.year, month_start.month, month_days)
+        visible_start = max(today, month_start)
+        visible_end = min(max_selectable, month_end)
+        if visible_start > visible_end:
+            continue
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{MONTH_LABELS[month_start.month - 1]} {month_start.year}",
+                    callback_data=DATE_CALLBACK_IGNORE,
                 )
-            cursor += timedelta(days=1)
-        rows.append(week_row)
+            ]
+        )
+        rows.append([InlineKeyboardButton(day, callback_data=DATE_CALLBACK_IGNORE) for day in WEEKDAY_LABELS])
+
+        grid_start = month_start - timedelta(days=month_start.weekday())
+        grid_end = month_end + timedelta(days=(6 - month_end.weekday()))
+        cursor = grid_start
+        while cursor <= grid_end:
+            week_row: list[InlineKeyboardButton] = []
+            for _ in range(7):
+                if visible_start <= cursor <= visible_end:
+                    label = str(cursor.day)
+                    if cursor == today:
+                        label = f"•{cursor.day}"
+                    week_row.append(
+                        InlineKeyboardButton(
+                            label,
+                            callback_data=f"{DATE_CALLBACK_PICK_PREFIX}{cursor.isoformat()}",
+                        )
+                    )
+                else:
+                    week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
+                cursor += timedelta(days=1)
+            rows.append(week_row)
+
+        if month_index < len(month_starts) - 1:
+            rows.append([InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE)])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -466,7 +510,7 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     await update.message.reply_text(
         (
             "Выберите дату проведения синхрона.\n"
-            f"Ближайший диапазон: {today.isoformat()} — {end_day.isoformat()}."
+            f"Доступный диапазон: {today.isoformat()} — {end_day.isoformat()}."
         ),
         reply_markup=build_date_picker_markup(),
     )
