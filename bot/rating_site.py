@@ -44,46 +44,51 @@ class RatingSiteClient:
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         cookie_jar = aiohttp.CookieJar()
 
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            cookie_jar=cookie_jar,
-            headers=self._build_default_headers(),
-        ) as session:
-            await self._login(session, email=email, password=password)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                cookie_jar=cookie_jar,
+                headers=self._build_default_headers(),
+            ) as session:
+                await self._login(session, email=email, password=password)
 
-            form_url = f"{self.base_url}/tournament/request?tournamentId={tournament_id}"
-            form_html, resolved_form_url = await self._get_text(
-                session,
-                form_url,
-                stage="request_get",
-            )
+                form_url = f"{self.base_url}/tournament/request?tournamentId={tournament_id}"
+                form_html, resolved_form_url = await self._get_text(
+                    session,
+                    form_url,
+                    stage="request_get",
+                )
 
-            form_data = self._extract_request_form(form_html, resolved_form_url)
-            self._fill_request_form(
-                form_data.fields,
-                tournament_id=tournament_id,
-                venue_id=venue_id,
-                date_start=date_start,
-                approximate_teams_count=approximate_teams_count,
-                narrator_id=narrator_id,
-                comment=comment,
-            )
+                form_data = self._extract_request_form(form_html, resolved_form_url)
+                self._fill_request_form(
+                    form_data.fields,
+                    tournament_id=tournament_id,
+                    venue_id=venue_id,
+                    date_start=date_start,
+                    approximate_teams_count=approximate_teams_count,
+                    narrator_id=narrator_id,
+                    comment=comment,
+                )
 
-            submit_html, submit_url = await self._post_form(
-                session,
-                form_data.action_url,
-                form_data.fields,
-                referer=resolved_form_url,
-                stage="request_post",
-            )
+                submit_html, submit_url = await self._post_form(
+                    session,
+                    form_data.action_url,
+                    form_data.fields,
+                    referer=resolved_form_url,
+                    stage="request_post",
+                )
 
-            self._raise_if_login_page(submit_url, submit_html)
-            self._raise_if_site_error(submit_html)
+                self._raise_if_login_page(submit_url, submit_html)
+                self._raise_if_site_error(submit_html)
 
-            return RequestSubmitResult(
-                final_url=submit_url,
-                message="Заявка отправлена. Проверьте статус на странице турнира.",
-            )
+                return RequestSubmitResult(
+                    final_url=submit_url,
+                    message="Заявка отправлена. Проверьте статус на странице турнира.",
+                )
+        except aiohttp.ClientError as exc:
+            raise RatingSiteError(f"Ошибка соединения с сайтом rating: {exc}") from exc
+        except TimeoutError as exc:
+            raise RatingSiteError("Таймаут при обращении к сайту rating") from exc
 
     async def _login(self, session: aiohttp.ClientSession, *, email: str, password: str) -> None:
         login_url = f"{self.base_url}/login"
@@ -283,9 +288,20 @@ class RatingSiteClient:
             target_form = forms[0]
 
         action = str(target_form.get("action") or "").strip()
-        action_url = urljoin(page_url, action or page_url)
+        action_url = self._resolve_form_action(page_url, action)
         fields = self._collect_form_fields(target_form)
         return RequestFormData(action_url=action_url, fields=fields)
+
+    def _resolve_form_action(self, page_url: str, action: str) -> str:
+        raw_action = (action or "").strip()
+        if not raw_action or raw_action == "#" or raw_action.casefold().startswith("javascript:"):
+            return page_url
+
+        candidate = urljoin(page_url, raw_action)
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"}:
+            return page_url
+        return candidate
 
     def _collect_form_fields(self, form: Tag) -> dict[str, str]:
         fields: dict[str, str] = {}
