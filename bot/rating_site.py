@@ -73,6 +73,14 @@ class RatingSiteClient:
                 request_candidates = self._extract_request_candidates(form_html)
 
                 form_data = self._extract_request_form(form_html, resolved_form_url)
+                requests_url = self._build_tournament_requests_url(
+                    submit_url=resolved_form_url,
+                    tournament_id=tournament_id,
+                )
+                before_request_ids = await self._safe_get_request_ids(
+                    session=session,
+                    requests_url=requests_url,
+                )
                 self._fill_request_form(
                     form_data.fields,
                     tournament_id=tournament_id,
@@ -97,16 +105,30 @@ class RatingSiteClient:
                 self._raise_if_login_page(submit_url, submit_html)
                 self._raise_if_site_error(submit_html)
                 request_id = self._extract_request_id(submit_url, submit_html)
-                if request_id is None and not self._has_success_marker(submit_html):
+                after_request_ids = await self._safe_get_request_ids(
+                    session=session,
+                    requests_url=requests_url,
+                )
+                request_id = self._resolve_request_id(
+                    explicit_request_id=request_id,
+                    before_request_ids=before_request_ids,
+                    after_request_ids=after_request_ids,
+                )
+
+                is_confirmed = request_id is not None
+                if not is_confirmed and self._has_success_marker(submit_html):
+                    # Fallback: UI may show server-side success message without requestId.
+                    is_confirmed = True
+                if not is_confirmed:
+                    before_count = len(before_request_ids) if before_request_ids is not None else "?"
+                    after_count = len(after_request_ids) if after_request_ids is not None else "?"
+                    final_path = urlparse(submit_url).path or "/"
                     raise RatingSiteError(
-                        "Сайт не подтвердил отправку заявки (нет requestId/успешного сообщения). "
+                        "Сайт не подтвердил отправку заявки "
+                        f"(path={final_path}, requests_before={before_count}, requests_after={after_count}). "
                         "Проверьте обязательные поля в форме."
                     )
 
-                requests_url = self._build_tournament_requests_url(
-                    submit_url=submit_url,
-                    tournament_id=tournament_id,
-                )
                 if request_id is not None:
                     message = (
                         f"Заявка отправлена (requestId={request_id}). "
@@ -222,6 +244,50 @@ class RatingSiteClient:
         parsed = urlparse(submit_url)
         base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
         return f"{base}/tournament/{tournament_id}/requests"
+
+    async def _safe_get_request_ids(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        requests_url: str,
+    ) -> Optional[set[int]]:
+        try:
+            html, _ = await self._get_text(
+                session,
+                requests_url,
+                stage="request_list_get",
+            )
+        except RatingSiteError:
+            return None
+        return self._extract_request_ids_from_html(html)
+
+    def _extract_request_ids_from_html(self, html: str) -> set[int]:
+        ids: set[int] = set()
+        if not html:
+            return ids
+        for match in re.finditer(r"requestId=(\d+)", html):
+            try:
+                ids.add(int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def _resolve_request_id(
+        self,
+        *,
+        explicit_request_id: Optional[int],
+        before_request_ids: Optional[set[int]],
+        after_request_ids: Optional[set[int]],
+    ) -> Optional[int]:
+        if explicit_request_id is not None:
+            return explicit_request_id
+        if before_request_ids is None or after_request_ids is None:
+            return None
+
+        new_ids = sorted(after_request_ids - before_request_ids)
+        if new_ids:
+            return new_ids[-1]
+        return None
 
     def _extract_request_id(self, submit_url: str, html: str) -> Optional[int]:
         parsed = urlparse(submit_url)
