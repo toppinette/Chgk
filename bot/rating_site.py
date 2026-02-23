@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from typing import Any, Optional
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
@@ -96,10 +96,28 @@ class RatingSiteClient:
 
                 self._raise_if_login_page(submit_url, submit_html)
                 self._raise_if_site_error(submit_html)
+                request_id = self._extract_request_id(submit_url, submit_html)
+                if request_id is None and not self._has_success_marker(submit_html):
+                    raise RatingSiteError(
+                        "Сайт не подтвердил отправку заявки (нет requestId/успешного сообщения). "
+                        "Проверьте обязательные поля в форме."
+                    )
+
+                requests_url = self._build_tournament_requests_url(
+                    submit_url=submit_url,
+                    tournament_id=tournament_id,
+                )
+                if request_id is not None:
+                    message = (
+                        f"Заявка отправлена (requestId={request_id}). "
+                        "Проверьте статус в списке заявок турнира."
+                    )
+                else:
+                    message = "Заявка отправлена. Проверьте статус в списке заявок турнира."
 
                 return RequestSubmitResult(
-                    final_url=submit_url,
-                    message="Заявка отправлена. Проверьте статус на странице турнира.",
+                    final_url=requests_url,
+                    message=message,
                 )
         except aiohttp.ClientError as exc:
             raise RatingSiteError(f"Ошибка соединения с сайтом rating: {exc}") from exc
@@ -199,6 +217,61 @@ class RatingSiteClient:
         base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
         query = urlencode({"tournamentId": tournament_id})
         return f"{base}/tournament/request?{query}"
+
+    def _build_tournament_requests_url(self, *, submit_url: str, tournament_id: int) -> str:
+        parsed = urlparse(submit_url)
+        base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
+        return f"{base}/tournament/{tournament_id}/requests"
+
+    def _extract_request_id(self, submit_url: str, html: str) -> Optional[int]:
+        parsed = urlparse(submit_url)
+        query = parse_qs(parsed.query)
+        request_values = query.get("requestId", [])
+        for value in request_values:
+            if value.isdigit():
+                return int(value)
+
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "html.parser")
+        # Sometimes requestId is present only in links/actions after redirect.
+        for node in soup.select("a[href], form[action]"):
+            target = str(node.get("href") or node.get("action") or "")
+            if "requestId=" not in target:
+                continue
+            parsed_target = urlparse(target)
+            target_query = parse_qs(parsed_target.query)
+            target_values = target_query.get("requestId", [])
+            for value in target_values:
+                if value.isdigit():
+                    return int(value)
+
+        return None
+
+    def _has_success_marker(self, html: str) -> bool:
+        if not html:
+            return False
+
+        soup = BeautifulSoup(html, "html.parser")
+        for selector in (".alert-success", "#success_message", ".success", ".toast-body"):
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            text = node.get_text(" ", strip=True).casefold()
+            if text and any(token in text for token in ("усп", "добав", "отправ", "создан", "принят")):
+                return True
+
+        text_blob = soup.get_text(" ", strip=True).casefold()
+        return any(
+            token in text_blob
+            for token in (
+                "заявка отправлена",
+                "заявка успешно",
+                "заявка добавлена",
+                "заявка принята",
+            )
+        )
 
     def _extract_request_candidates(self, html: str) -> list[str]:
         if not html:
