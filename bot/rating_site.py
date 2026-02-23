@@ -106,41 +106,53 @@ class RatingSiteClient:
         tournament_id: int,
         request_candidates: list[str],
     ) -> tuple[str, str]:
-        try:
-            return await self._submit_form(
-                session=session,
-                method=form_method,
-                action_url=action_url,
-                fields=form_fields,
-                referer=referer,
-                stage="request_submit",
-            )
-        except RatingSiteError as exc:
-            message = str(exc)
-            if "[request_submit]" not in message or "HTTP 405" not in message:
-                raise
+        normalized_method = (form_method or "GET").strip().upper() or "GET"
+        method_variants = [normalized_method]
+        if normalized_method == "GET":
+            method_variants.append("POST")
+        elif normalized_method == "POST":
+            method_variants.append("GET")
 
-            fallback_url = self._build_request_fallback_url(
-                tournament_id=tournament_id,
-                referer=referer,
-            )
+        fallback_url = self._build_request_fallback_url(
+            tournament_id=tournament_id,
+            referer=referer,
+        )
+        url_variants = [action_url]
+        if fallback_url != action_url:
+            url_variants.append(fallback_url)
+
+        attempts: list[tuple[str, str]] = []
+        for url in url_variants:
+            for method in method_variants:
+                attempts.append((url, method))
+
+        last_405_error: RatingSiteError | None = None
+        for index, (url, method) in enumerate(attempts, start=1):
+            stage = f"request_submit_{index}_{method.lower()}"
             try:
                 return await self._submit_form(
                     session=session,
-                    method=form_method,
-                    action_url=fallback_url,
+                    method=method,
+                    action_url=url,
                     fields=form_fields,
                     referer=referer,
-                    stage="request_submit_fallback",
+                    stage=stage,
                 )
-            except RatingSiteError as fallback_exc:
-                fallback_message = str(fallback_exc)
-                if "[request_submit_fallback]" in fallback_message and "HTTP 405" in fallback_message:
-                    candidates = ", ".join(request_candidates[:8]) if request_candidates else "не найдены"
-                    raise RatingSiteError(
-                        f"{fallback_message} Возможные request-endpoints в HTML: {candidates}"
-                    ) from fallback_exc
-                raise
+            except RatingSiteError as exc:
+                if "HTTP 405" not in str(exc):
+                    raise
+                last_405_error = exc
+                continue
+
+        if last_405_error is not None:
+            candidates = ", ".join(request_candidates[:8]) if request_candidates else "не найдены"
+            attempted = ", ".join(f"{method} {urlparse(url).path or '/'}" for url, method in attempts)
+            raise RatingSiteError(
+                f"{last_405_error} Варианты отправки: {attempted}. "
+                f"Возможные request-endpoints в HTML: {candidates}"
+            ) from last_405_error
+
+        raise RatingSiteError("Не удалось отправить заявку: все варианты отправки завершились ошибкой.")
 
     def _build_request_fallback_url(self, *, tournament_id: int, referer: str) -> str:
         parsed = urlparse(referer)
