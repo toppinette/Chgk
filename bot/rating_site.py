@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Optional
 from urllib.parse import urlencode, urljoin, urlparse
 
@@ -21,6 +22,7 @@ class RequestSubmitResult:
 @dataclass(slots=True)
 class RequestFormData:
     action_url: str
+    method: str
     fields: dict[str, str]
 
 
@@ -58,6 +60,7 @@ class RatingSiteClient:
                     form_url,
                     stage="request_get",
                 )
+                request_candidates = self._extract_request_candidates(form_html)
 
                 form_data = self._extract_request_form(form_html, resolved_form_url)
                 self._fill_request_form(
@@ -73,9 +76,11 @@ class RatingSiteClient:
                 submit_html, submit_url = await self._submit_request_with_fallback(
                     session=session,
                     action_url=form_data.action_url,
+                    form_method=form_data.method,
                     form_fields=form_data.fields,
                     referer=resolved_form_url,
                     tournament_id=tournament_id,
+                    request_candidates=request_candidates,
                 )
 
                 self._raise_if_login_page(submit_url, submit_html)
@@ -95,40 +100,69 @@ class RatingSiteClient:
         *,
         session: aiohttp.ClientSession,
         action_url: str,
+        form_method: str,
         form_fields: dict[str, str],
         referer: str,
         tournament_id: int,
+        request_candidates: list[str],
     ) -> tuple[str, str]:
         try:
-            return await self._post_form(
-                session,
-                action_url,
-                form_fields,
+            return await self._submit_form(
+                session=session,
+                method=form_method,
+                action_url=action_url,
+                fields=form_fields,
                 referer=referer,
-                stage="request_post",
+                stage="request_submit",
             )
         except RatingSiteError as exc:
             message = str(exc)
-            if "[request_post]" not in message or "HTTP 405" not in message:
+            if "[request_submit]" not in message or "HTTP 405" not in message:
                 raise
 
             fallback_url = self._build_request_fallback_url(
                 tournament_id=tournament_id,
                 referer=referer,
             )
-            return await self._post_form(
-                session,
-                fallback_url,
-                form_fields,
-                referer=referer,
-                stage="request_post_fallback",
-            )
+            try:
+                return await self._submit_form(
+                    session=session,
+                    method=form_method,
+                    action_url=fallback_url,
+                    fields=form_fields,
+                    referer=referer,
+                    stage="request_submit_fallback",
+                )
+            except RatingSiteError as fallback_exc:
+                fallback_message = str(fallback_exc)
+                if "[request_submit_fallback]" in fallback_message and "HTTP 405" in fallback_message:
+                    candidates = ", ".join(request_candidates[:8]) if request_candidates else "не найдены"
+                    raise RatingSiteError(
+                        f"{fallback_message} Возможные request-endpoints в HTML: {candidates}"
+                    ) from fallback_exc
+                raise
 
     def _build_request_fallback_url(self, *, tournament_id: int, referer: str) -> str:
         parsed = urlparse(referer)
         base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
         query = urlencode({"tournamentId": tournament_id})
         return f"{base}/tournament/request?{query}"
+
+    def _extract_request_candidates(self, html: str) -> list[str]:
+        if not html:
+            return []
+
+        candidates: set[str] = set()
+        # Find URL-like tokens that mention "request"; useful for JS-driven submit endpoints.
+        for match in re.finditer(r'["\']([^"\']*request[^"\']*)["\']', html, flags=re.IGNORECASE):
+            token = match.group(1).strip()
+            if not token:
+                continue
+            token = token.replace("\\/", "/")
+            if token.startswith("http://") or token.startswith("https://") or token.startswith("/"):
+                candidates.add(token)
+
+        return sorted(candidates)
 
     async def _login(self, session: aiohttp.ClientSession, *, email: str, password: str) -> None:
         login_url = f"{self.base_url}/login"
@@ -220,6 +254,45 @@ class RatingSiteClient:
                 "Origin": origin,
             },
         ) as response:
+            html = await response.text()
+            if response.status >= 400:
+                base = self._http_error_message(response.status, str(response.url))
+                detail = self._extract_error_detail_from_html(html)
+                headers_hint = self._extract_error_headers(response.headers)
+                prefix = f"[{stage}] "
+                if detail:
+                    raise RatingSiteError(f"{prefix}{base} {detail} {headers_hint}".strip())
+                raise RatingSiteError(f"{prefix}{base} {headers_hint}".strip())
+            return html, str(response.url)
+
+    async def _submit_form(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        method: str,
+        action_url: str,
+        fields: dict[str, str],
+        referer: str,
+        stage: str,
+    ) -> tuple[str, str]:
+        normalized_method = (method or "GET").strip().upper() or "GET"
+        headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "Referer": referer,
+        }
+        if normalized_method != "GET":
+            headers["Origin"] = self._origin_from_url(referer)
+
+        request_kwargs: dict[str, Any] = {
+            "allow_redirects": True,
+            "headers": headers,
+        }
+        if normalized_method == "GET":
+            request_kwargs["params"] = fields
+        else:
+            request_kwargs["data"] = fields
+
+        async with session.request(normalized_method, action_url, **request_kwargs) as response:
             html = await response.text()
             if response.status >= 400:
                 base = self._http_error_message(response.status, str(response.url))
@@ -328,9 +401,10 @@ class RatingSiteClient:
             target_form = forms[0]
 
         action = str(target_form.get("action") or "").strip()
+        method = str(target_form.get("method") or "GET").strip().upper() or "GET"
         action_url = self._resolve_form_action(page_url, action)
         fields = self._collect_form_fields(target_form)
-        return RequestFormData(action_url=action_url, fields=fields)
+        return RequestFormData(action_url=action_url, method=method, fields=fields)
 
     def _resolve_form_action(self, page_url: str, action: str) -> str:
         raw_action = (action or "").strip()
