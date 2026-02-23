@@ -52,6 +52,7 @@ POLL_OPTION_NONE = "Не буду играть ни один"
 
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
+PENDING_REQUEST_SITE_PASSWORD = "request_site_password"
 PENDING_REQUEST_TOURNAMENT = "request_tournament"
 PENDING_REQUEST_VENUE = "request_venue"
 PENDING_REQUEST_REPRESENTATIVE = "request_representative"
@@ -136,6 +137,13 @@ def get_rating_site(context: ContextTypes.DEFAULT_TYPE) -> RatingSiteClient:
 
 def hide_main_keyboard() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
+
+
+def build_version_label() -> str:
+    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
+    if not commit:
+        return "local"
+    return commit[:7]
 
 
 def build_main_menu_markup(*, is_authorized: bool, role: str | None) -> ReplyKeyboardMarkup:
@@ -313,6 +321,7 @@ def truncate_option(text: str, max_len: int = 100) -> str:
 def reset_request_draft(state: RuntimeState) -> None:
     state.request_draft = None
     if state.pending_action in {
+        PENDING_REQUEST_SITE_PASSWORD,
         PENDING_REQUEST_TOURNAMENT,
         PENDING_REQUEST_VENUE,
         PENDING_REQUEST_REPRESENTATIVE,
@@ -398,6 +407,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text,
         reply_markup=main_menu_markup(context, update.effective_user.id),
     )
+
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    await update.message.reply_text(f"Версия: {build_version_label()}")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -648,6 +663,55 @@ async def prompt_request_representative_step(
     )
 
 
+async def continue_request_flow(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    state = get_runtime_state(context, user_id)
+    draft = state.request_draft
+    if draft is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Черновик заявки потерян. Начните снова: /request",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    tournament_id = draft.tournament_id
+    if tournament_id is None:
+        state.pending_action = PENDING_REQUEST_TOURNAMENT
+        if state.tournament_order:
+            sample = ", ".join(str(item) for item in state.tournament_order[:10])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Введите ID турнира для подачи заявки.\n"
+                    f"Недавно загруженные ID: {sample}"
+                ),
+                reply_markup=main_menu_markup(context, user_id),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Введите ID турнира (число).",
+                reply_markup=main_menu_markup(context, user_id),
+            )
+        return
+
+    await load_request_prefill(
+        context=context,
+        user_id=user_id,
+        tournament_id=tournament_id,
+    )
+    await prompt_request_venue_step(
+        context=context,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+
 async def start_request_flow(
     *,
     context: ContextTypes.DEFAULT_TYPE,
@@ -679,33 +743,19 @@ async def start_request_flow(
         tournament_id = None
 
     state.request_draft = TournamentRequestDraft(tournament_id=tournament_id)
-
-    if tournament_id is None:
-        state.pending_action = PENDING_REQUEST_TOURNAMENT
-        if state.tournament_order:
-            sample = ", ".join(str(item) for item in state.tournament_order[:10])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Введите ID турнира для подачи заявки.\n"
-                    f"Недавно загруженные ID: {sample}"
-                ),
-                reply_markup=main_menu_markup(context, user_id),
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Введите ID турнира (число).",
-                reply_markup=main_menu_markup(context, user_id),
-            )
+    if not state.site_password:
+        state.pending_action = PENDING_REQUEST_SITE_PASSWORD
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Введите пароль от rating.chgk.info для автоподстановки данных заявки.\n"
+                "Сообщение с паролем будет удалено."
+            ),
+            reply_markup=main_menu_markup(context, user_id),
+        )
         return
 
-    await load_request_prefill(
-        context=context,
-        user_id=user_id,
-        tournament_id=tournament_id,
-    )
-    await prompt_request_venue_step(
+    await continue_request_flow(
         context=context,
         chat_id=chat_id,
         user_id=user_id,
@@ -1070,6 +1120,91 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
 
+async def submit_request_draft(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    password: str,
+) -> None:
+    state = get_runtime_state(context, user_id)
+    draft = state.request_draft
+    if draft is None:
+        state.pending_action = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Черновик заявки потерян. Начните снова: /request",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    if (
+        draft.tournament_id is None
+        or draft.venue_id is None
+        or draft.representative_id is None
+        or draft.date_start is None
+        or draft.narrator_id is None
+    ):
+        state.pending_action = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Черновик заявки неполный. Начните снова: /request",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    storage = get_storage(context)
+    persisted = storage.get_user_state(user_id)
+    if not persisted.rating_email:
+        state.pending_action = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Не найден email. Выполните /login и повторите.",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    rating_site = get_rating_site(context)
+    state.site_password = password
+    await context.bot.send_message(chat_id=chat_id, text="Отправляю заявку на сайт...")
+
+    try:
+        result = await rating_site.submit_tournament_request(
+            email=persisted.rating_email,
+            password=password,
+            tournament_id=draft.tournament_id,
+            venue_id=draft.venue_id,
+            representative_id=draft.representative_id,
+            date_start=draft.date_start,
+            approximate_teams_count=draft.approximate_teams_count,
+            narrator_id=draft.narrator_id,
+            comment=draft.comment,
+        )
+    except RatingSiteError as exc:
+        reset_request_draft(state)
+        logging.warning(
+            "Tournament request submit failed for user_id=%s email=%s tournament_id=%s: %s",
+            user_id,
+            persisted.rating_email,
+            draft.tournament_id,
+            exc,
+        )
+        await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить заявку: {exc}")
+        return
+
+    storage.upsert_default_venue(
+        user_id,
+        venue_id=draft.venue_id,
+        venue_label=draft.default_venue_label or f"ID {draft.venue_id}",
+    )
+    reset_request_draft(state)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{result.message}\nURL: {result.final_url}",
+        reply_markup=main_menu_markup(context, user_id),
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
@@ -1175,6 +1310,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if state.pending_action == PENDING_REQUEST_SITE_PASSWORD:
+        if state.request_draft is None:
+            state.pending_action = None
+            await update.message.reply_text("Черновик заявки потерян. Начните снова: /request")
+            return
+
+        password = text.strip()
+        if not password:
+            await update.message.reply_text("Пароль не может быть пустым.")
+            return
+
+        state.site_password = password
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        await continue_request_flow(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+        )
+        return
+
     if state.pending_action == PENDING_REQUEST_TOURNAMENT:
         if state.request_draft is None:
             state.request_draft = TournamentRequestDraft()
@@ -1189,12 +1348,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         state.request_draft.tournament_id = tournament_id
-        await load_request_prefill(
-            context=context,
-            user_id=user_id,
-            tournament_id=tournament_id,
-        )
-        await prompt_request_venue_step(
+        await continue_request_flow(
             context=context,
             chat_id=update.effective_chat.id,
             user_id=user_id,
@@ -1322,87 +1476,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         state.request_draft.comment = None if text.casefold() in SKIP_MARKERS else text
-        state.pending_action = PENDING_REQUEST_PASSWORD
-        storage = get_storage(context)
-        persisted = storage.get_user_state(user_id)
-        email_label = persisted.rating_email or "(не указан)"
-        await update.message.reply_text(
-            (
-                "Шаг 7/7: введите пароль от rating.chgk.info для отправки заявки.\n"
-                f"Используется email: {email_label}\n"
-                "Если нужен другой аккаунт, сначала выполните «Авторизация»."
+        if state.site_password:
+            state.pending_action = PENDING_REQUEST_PASSWORD
+            await update.message.reply_text("Шаг 7/7: использую ранее введённый пароль.")
+            await submit_request_draft(
+                context=context,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                password=state.site_password,
             )
-        )
+        else:
+            state.pending_action = PENDING_REQUEST_PASSWORD
+            storage = get_storage(context)
+            persisted = storage.get_user_state(user_id)
+            email_label = persisted.rating_email or "(не указан)"
+            await update.message.reply_text(
+                (
+                    "Шаг 7/7: введите пароль от rating.chgk.info для отправки заявки.\n"
+                    f"Используется email: {email_label}\n"
+                    "Если нужен другой аккаунт, сначала выполните «Авторизация»."
+                )
+            )
         return
 
     if state.pending_action == PENDING_REQUEST_PASSWORD:
-        draft = state.request_draft
-        if draft is None:
-            state.pending_action = None
-            await update.message.reply_text("Черновик заявки потерян. Начните снова: /request")
+        password = text.strip()
+        if not password:
+            await update.message.reply_text("Пароль не может быть пустым.")
             return
-
-        if (
-            draft.tournament_id is None
-            or draft.venue_id is None
-            or draft.representative_id is None
-            or draft.date_start is None
-            or draft.narrator_id is None
-        ):
-            state.pending_action = None
-            await update.message.reply_text("Черновик заявки неполный. Начните снова: /request")
-            return
-
-        storage = get_storage(context)
-        persisted = storage.get_user_state(user_id)
-        if not persisted.rating_email:
-            state.pending_action = None
-            await update.message.reply_text("Не найден email. Выполните /login и повторите.")
-            return
-
-        rating_site = get_rating_site(context)
-        password = text
         state.site_password = password
         try:
             await update.message.delete()
         except Exception:
             pass
-
-        await update.message.reply_text("Отправляю заявку на сайт...")
-
-        try:
-            result = await rating_site.submit_tournament_request(
-                email=persisted.rating_email,
-                password=password,
-                tournament_id=draft.tournament_id,
-                venue_id=draft.venue_id,
-                representative_id=draft.representative_id,
-                date_start=draft.date_start,
-                approximate_teams_count=draft.approximate_teams_count,
-                narrator_id=draft.narrator_id,
-                comment=draft.comment,
-            )
-        except RatingSiteError as exc:
-            reset_request_draft(state)
-            logging.warning(
-                "Tournament request submit failed for user_id=%s email=%s tournament_id=%s: %s",
-                user_id,
-                persisted.rating_email,
-                draft.tournament_id,
-                exc,
-            )
-            await update.message.reply_text(f"Не удалось отправить заявку: {exc}")
-            return
-
-        storage.upsert_default_venue(
-            user_id,
-            venue_id=draft.venue_id,
-            venue_label=draft.default_venue_label or f"ID {draft.venue_id}",
-        )
-        reset_request_draft(state)
-        await update.message.reply_text(
-            f"{result.message}\nURL: {result.final_url}",
-            reply_markup=main_menu_markup(context, user_id),
+        await submit_request_draft(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+            password=password,
         )
         return
 
@@ -1440,6 +1551,9 @@ async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT
     if command_name == "poll":
         await poll_command(update, context)
         return
+    if command_name == "version":
+        await version_command(update, context)
+        return
     if command_name in {"create_venue", "venue"}:
         await create_venue(update, context)
         return
@@ -1450,7 +1564,7 @@ async def handle_unmatched_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(
         (
             "Команда не распознана. Доступно: /start, /login, /role, /date, "
-            "/poll, /request, /create_venue, /cancel, /logout."
+            "/poll, /request, /create_venue, /cancel, /logout, /version."
         ),
         reply_markup=main_menu_markup(context, update.effective_user.id)
         if update.effective_user is not None
@@ -1544,6 +1658,7 @@ def main() -> None:
     application.add_handler(CommandHandler("date", request_representative_date))
     application.add_handler(CommandHandler("request", request_command))
     application.add_handler(CommandHandler("poll", poll_command))
+    application.add_handler(CommandHandler("version", version_command))
     application.add_handler(CommandHandler("create_venue", create_venue))
     application.add_handler(CommandHandler("venue", create_venue))
     application.add_handler(CallbackQueryHandler(handle_callback))
