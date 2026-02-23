@@ -143,7 +143,11 @@ class RatingSiteClient:
         ) as response:
             html = await response.text()
             if response.status >= 400:
-                raise RatingSiteError(self._http_error_message(response.status, str(response.url)))
+                base = self._http_error_message(response.status, str(response.url))
+                detail = self._extract_error_detail_from_html(html)
+                if detail:
+                    raise RatingSiteError(f"{base} {detail}")
+                raise RatingSiteError(base)
             return html, str(response.url)
 
     def _build_default_headers(self) -> dict[str, str]:
@@ -170,6 +174,28 @@ class RatingSiteClient:
                 "Обычно это блокировка формы/доступа или anti-bot проверка."
             )
         return f"Сайт rating вернул HTTP {status} на {path}"
+
+    def _extract_error_detail_from_html(self, html: str) -> str:
+        if not html:
+            return ""
+
+        lowered = html.casefold()
+        if "cloudflare" in lowered or "just a moment" in lowered:
+            return "Похоже на защиту Cloudflare (бот-запрос отклонен)."
+
+        soup = BeautifulSoup(html, "html.parser")
+        for selector in (".alert-danger", ".error", "#error_message", "h1", "title"):
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            text = node.get_text(" ", strip=True)
+            if text:
+                return f"Деталь: {text[:300]}"
+
+        plain = " ".join(html.split())
+        if plain:
+            return f"Фрагмент ответа: {plain[:300]}"
+        return ""
 
     def _extract_request_form(self, html: str, page_url: str) -> RequestFormData:
         form = self._extract_form(html, page_url, action_suffix="/tournament/request")
