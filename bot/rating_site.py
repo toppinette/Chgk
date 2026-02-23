@@ -145,9 +145,10 @@ class RatingSiteClient:
             if response.status >= 400:
                 base = self._http_error_message(response.status, str(response.url))
                 detail = self._extract_error_detail_from_html(html)
+                headers_hint = self._extract_error_headers(response.headers)
                 if detail:
-                    raise RatingSiteError(f"{base} {detail}")
-                raise RatingSiteError(base)
+                    raise RatingSiteError(f"{base} {detail} {headers_hint}".strip())
+                raise RatingSiteError(f"{base} {headers_hint}".strip())
             return html, str(response.url)
 
     def _build_default_headers(self) -> dict[str, str]:
@@ -196,6 +197,24 @@ class RatingSiteClient:
         if plain:
             return f"Фрагмент ответа: {plain[:300]}"
         return ""
+
+    def _extract_error_headers(self, headers: aiohttp.typedefs.LooseHeaders) -> str:
+        header_map = dict(headers) if headers else {}
+        server = str(header_map.get("Server") or "").strip()
+        cf_ray = str(header_map.get("CF-Ray") or "").strip()
+        content_type = str(header_map.get("Content-Type") or "").strip()
+
+        parts: list[str] = []
+        if server:
+            parts.append(f"Server={server}")
+        if cf_ray:
+            parts.append(f"CF-Ray={cf_ray}")
+        if content_type:
+            parts.append(f"Content-Type={content_type}")
+
+        if not parts:
+            return ""
+        return "Заголовки: " + ", ".join(parts)
 
     def _extract_request_form(self, html: str, page_url: str) -> RequestFormData:
         form = self._extract_form(html, page_url, action_suffix="/tournament/request")
