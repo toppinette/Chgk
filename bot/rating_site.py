@@ -199,10 +199,16 @@ class RatingSiteClient:
         return ""
 
     def _extract_error_headers(self, headers: aiohttp.typedefs.LooseHeaders) -> str:
-        header_map = dict(headers) if headers else {}
-        server = str(header_map.get("Server") or "").strip()
-        cf_ray = str(header_map.get("CF-Ray") or "").strip()
-        content_type = str(header_map.get("Content-Type") or "").strip()
+        if not headers:
+            return ""
+
+        raw_map = dict(headers)
+        header_map = {str(key).casefold(): str(value) for key, value in raw_map.items()}
+
+        server = header_map.get("server", "").strip()
+        cf_ray = header_map.get("cf-ray", "").strip()
+        content_type = header_map.get("content-type", "").strip()
+        location = header_map.get("location", "").strip()
 
         parts: list[str] = []
         if server:
@@ -211,6 +217,8 @@ class RatingSiteClient:
             parts.append(f"CF-Ray={cf_ray}")
         if content_type:
             parts.append(f"Content-Type={content_type}")
+        if location:
+            parts.append(f"Location={location}")
 
         if not parts:
             return ""
