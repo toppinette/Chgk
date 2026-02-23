@@ -12,6 +12,10 @@ class PersistedUserState:
     rating_email: Optional[str]
     rating_token: Optional[str]
     role: Optional[str]
+    player_id: Optional[int]
+    player_name: Optional[str]
+    default_venue_id: Optional[int]
+    default_venue_label: Optional[str]
 
 
 class BotStorage:
@@ -33,6 +37,10 @@ class BotStorage:
                     rating_email TEXT,
                     rating_token TEXT,
                     role TEXT,
+                    player_id INTEGER,
+                    player_name TEXT,
+                    default_venue_id INTEGER,
+                    default_venue_label TEXT,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -43,11 +51,23 @@ class BotStorage:
             }
             if "rating_email" not in columns:
                 conn.execute("ALTER TABLE user_state ADD COLUMN rating_email TEXT")
+            if "player_id" not in columns:
+                conn.execute("ALTER TABLE user_state ADD COLUMN player_id INTEGER")
+            if "player_name" not in columns:
+                conn.execute("ALTER TABLE user_state ADD COLUMN player_name TEXT")
+            if "default_venue_id" not in columns:
+                conn.execute("ALTER TABLE user_state ADD COLUMN default_venue_id INTEGER")
+            if "default_venue_label" not in columns:
+                conn.execute("ALTER TABLE user_state ADD COLUMN default_venue_label TEXT")
 
     def get_user_state(self, user_id: int) -> PersistedUserState:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT user_id, rating_email, rating_token, role FROM user_state WHERE user_id = ?",
+                (
+                    "SELECT user_id, rating_email, rating_token, role, "
+                    "player_id, player_name, default_venue_id, default_venue_label "
+                    "FROM user_state WHERE user_id = ?"
+                ),
                 (user_id,),
             ).fetchone()
 
@@ -57,6 +77,10 @@ class BotStorage:
                 rating_email=None,
                 rating_token=None,
                 role=None,
+                player_id=None,
+                player_name=None,
+                default_venue_id=None,
+                default_venue_label=None,
             )
 
         return PersistedUserState(
@@ -64,6 +88,10 @@ class BotStorage:
             rating_email=row["rating_email"],
             rating_token=row["rating_token"],
             role=row["role"],
+            player_id=row["player_id"],
+            player_name=row["player_name"],
+            default_venue_id=row["default_venue_id"],
+            default_venue_label=row["default_venue_label"],
         )
 
     def upsert_role(self, user_id: int, role: str) -> None:
@@ -103,6 +131,46 @@ class BotStorage:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (user_id, email),
+            )
+
+    def upsert_player_profile(
+        self,
+        user_id: int,
+        *,
+        player_id: Optional[int],
+        player_name: Optional[str],
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_state (user_id, player_id, player_name, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    player_id = excluded.player_id,
+                    player_name = excluded.player_name,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, player_id, player_name),
+            )
+
+    def upsert_default_venue(
+        self,
+        user_id: int,
+        *,
+        venue_id: int,
+        venue_label: Optional[str],
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_state (user_id, default_venue_id, default_venue_label, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    default_venue_id = excluded.default_venue_id,
+                    default_venue_label = excluded.default_venue_label,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, venue_id, venue_label),
             )
 
     def clear_rating_token(self, user_id: int) -> None:

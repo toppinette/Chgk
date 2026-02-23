@@ -51,20 +51,23 @@ POLL_OPTION_NONE = "Не буду играть ни один"
 
 PENDING_LOGIN_EMAIL = "login_email"
 PENDING_LOGIN_PASSWORD = "login_password"
-PENDING_REPRESENTATIVE_DATE = "representative_date"
 PENDING_REQUEST_TOURNAMENT = "request_tournament"
 PENDING_REQUEST_VENUE = "request_venue"
+PENDING_REQUEST_REPRESENTATIVE = "request_representative"
 PENDING_REQUEST_DATE = "request_date"
 PENDING_REQUEST_TEAMS = "request_teams"
 PENDING_REQUEST_NARRATOR = "request_narrator"
 PENDING_REQUEST_COMMENT = "request_comment"
 PENDING_REQUEST_PASSWORD = "request_password"
 
-DATE_PICKER_DAYS = 21
+DATE_PICKER_DAYS = 60
 DATE_CALLBACK_IGNORE = "date:ignore"
-DATE_CALLBACK_MANUAL = "date:manual"
 DATE_CALLBACK_PICK_PREFIX = "date:pick:"
 REQUEST_CALLBACK_START_PREFIX = "request:start:"
+REQUEST_CALLBACK_VENUE_DEFAULT = "request:venue:default"
+REQUEST_CALLBACK_VENUE_CUSTOM = "request:venue:custom"
+REQUEST_CALLBACK_REPRESENTATIVE_DEFAULT = "request:representative:default"
+REQUEST_CALLBACK_REPRESENTATIVE_CUSTOM = "request:representative:custom"
 
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 SKIP_MARKERS = {"-", "нет", "пропустить"}
@@ -74,16 +77,22 @@ SKIP_MARKERS = {"-", "нет", "пропустить"}
 class TournamentRequestDraft:
     tournament_id: int | None = None
     venue_id: int | None = None
+    representative_id: int | None = None
     date_start: str | None = None
     approximate_teams_count: int | None = None
     narrator_id: int | None = None
     comment: str | None = None
+    default_venue_id: int | None = None
+    default_venue_label: str | None = None
+    default_representative_id: int | None = None
+    default_representative_label: str | None = None
 
 
 @dataclass(slots=True)
 class RuntimeState:
     pending_action: str | None = None
     temp_email: str | None = None
+    site_password: str | None = None
     selected_date: date | None = None
     tournaments: dict[int, TournamentSummary] = field(default_factory=dict)
     tournament_order: list[int] = field(default_factory=list)
@@ -186,6 +195,7 @@ def build_date_picker_markup(
     window_days: int = DATE_PICKER_DAYS,
 ) -> InlineKeyboardMarkup:
     today = date.today()
+    max_selectable = today + timedelta(days=window_days - 1)
     calendar_end = get_date_picker_end(window_days)
     calendar_start = today - timedelta(days=today.weekday())
 
@@ -197,7 +207,7 @@ def build_date_picker_markup(
     while cursor <= calendar_end:
         week_row: list[InlineKeyboardButton] = []
         for _ in range(7):
-            if cursor < today:
+            if cursor < today or cursor > max_selectable:
                 week_row.append(InlineKeyboardButton("·", callback_data=DATE_CALLBACK_IGNORE))
             else:
                 label = str(cursor.day)
@@ -211,10 +221,6 @@ def build_date_picker_markup(
                 )
             cursor += timedelta(days=1)
         rows.append(week_row)
-
-    rows.append(
-        [InlineKeyboardButton("✍️ Ввести дату вручную", callback_data=DATE_CALLBACK_MANUAL)]
-    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -265,6 +271,7 @@ def reset_request_draft(state: RuntimeState) -> None:
     if state.pending_action in {
         PENDING_REQUEST_TOURNAMENT,
         PENDING_REQUEST_VENUE,
+        PENDING_REQUEST_REPRESENTATIVE,
         PENDING_REQUEST_DATE,
         PENDING_REQUEST_TEAMS,
         PENDING_REQUEST_NARRATOR,
@@ -388,6 +395,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_runtime_state(context, update.effective_user.id)
     state.pending_action = None
     state.temp_email = None
+    state.site_password = None
     state.request_draft = None
 
     await update.message.reply_text(
@@ -454,13 +462,145 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     state.pending_action = None
 
     today = date.today()
-    end_day = get_date_picker_end(DATE_PICKER_DAYS)
+    end_day = today + timedelta(days=DATE_PICKER_DAYS - 1)
     await update.message.reply_text(
         (
             "Выберите дату проведения синхрона.\n"
             f"Ближайший диапазон: {today.isoformat()} — {end_day.isoformat()}."
         ),
         reply_markup=build_date_picker_markup(),
+    )
+
+
+async def load_request_prefill(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    tournament_id: int,
+) -> None:
+    storage = get_storage(context)
+    persisted = storage.get_user_state(user_id)
+    state = get_runtime_state(context, user_id)
+    draft = state.request_draft
+
+    if draft is None:
+        return
+
+    draft.default_venue_id = persisted.default_venue_id
+    draft.default_venue_label = persisted.default_venue_label
+    draft.default_representative_id = persisted.player_id
+    draft.default_representative_label = persisted.player_name
+
+    if not persisted.rating_email or not state.site_password:
+        return
+
+    rating_site = get_rating_site(context)
+    try:
+        prefill = await rating_site.get_request_prefill(
+            email=persisted.rating_email,
+            password=state.site_password,
+            tournament_id=tournament_id,
+        )
+    except RatingSiteError as exc:
+        logging.info(
+            "Request prefill unavailable for user_id=%s tournament_id=%s: %s",
+            user_id,
+            tournament_id,
+            exc,
+        )
+        return
+
+    if prefill.venue_id is not None:
+        draft.default_venue_id = prefill.venue_id
+        draft.default_venue_label = prefill.venue_label or f"ID {prefill.venue_id}"
+
+    if prefill.representative_id is not None:
+        draft.default_representative_id = prefill.representative_id
+        draft.default_representative_label = (
+            prefill.representative_label or f"ID {prefill.representative_id}"
+        )
+
+    if prefill.approximate_teams_count is not None:
+        draft.approximate_teams_count = prefill.approximate_teams_count
+
+
+async def prompt_request_venue_step(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    state = get_runtime_state(context, user_id)
+    draft = state.request_draft
+    state.pending_action = PENDING_REQUEST_VENUE
+
+    if draft is None:
+        await context.bot.send_message(chat_id=chat_id, text="Черновик заявки потерян. Начните снова: /request")
+        return
+
+    if draft.default_venue_id is not None:
+        venue_label = draft.default_venue_label or f"ID {draft.default_venue_id}"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Шаг 1/7: площадка.\n"
+                f"По умолчанию: {venue_label}\n"
+                "Выберите действие:"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Использовать площадку по умолчанию", callback_data=REQUEST_CALLBACK_VENUE_DEFAULT)],
+                    [InlineKeyboardButton("✏️ Выбрать другую площадку", callback_data=REQUEST_CALLBACK_VENUE_CUSTOM)],
+                ]
+            ),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Шаг 1/7: введите ID площадки (venue ID).",
+        reply_markup=main_menu_markup(context, user_id),
+    )
+
+
+async def prompt_request_representative_step(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    state = get_runtime_state(context, user_id)
+    draft = state.request_draft
+    state.pending_action = PENDING_REQUEST_REPRESENTATIVE
+
+    if draft is None:
+        await context.bot.send_message(chat_id=chat_id, text="Черновик заявки потерян. Начните снова: /request")
+        return
+
+    if draft.default_representative_id is not None:
+        representative_label = (
+            draft.default_representative_label or f"ID {draft.default_representative_id}"
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Шаг 2/7: представитель.\n"
+                f"По умолчанию: {representative_label}\n"
+                "Выберите действие:"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Использовать представителя по умолчанию", callback_data=REQUEST_CALLBACK_REPRESENTATIVE_DEFAULT)],
+                    [InlineKeyboardButton("✏️ Выбрать другого представителя", callback_data=REQUEST_CALLBACK_REPRESENTATIVE_CUSTOM)],
+                ]
+            ),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Шаг 2/7: введите ID представителя.",
+        reply_markup=main_menu_markup(context, user_id),
     )
 
 
@@ -516,11 +656,15 @@ async def start_request_flow(
             )
         return
 
-    state.pending_action = PENDING_REQUEST_VENUE
-    await context.bot.send_message(
+    await load_request_prefill(
+        context=context,
+        user_id=user_id,
+        tournament_id=tournament_id,
+    )
+    await prompt_request_venue_step(
+        context=context,
         chat_id=chat_id,
-        text="Шаг 1/6: введите ID площадки (venue ID).",
-        reply_markup=main_menu_markup(context, user_id),
+        user_id=user_id,
     )
 
 
@@ -751,6 +895,73 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    if data == REQUEST_CALLBACK_VENUE_DEFAULT:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        state = get_runtime_state(context, user_id)
+        draft = state.request_draft
+        if draft is None or draft.default_venue_id is None:
+            await query.answer("Площадка по умолчанию не найдена.", show_alert=True)
+            return
+
+        draft.venue_id = draft.default_venue_id
+        await query.answer("Площадка выбрана.")
+        await prompt_request_representative_step(
+            context=context,
+            chat_id=callback_chat_id,
+            user_id=user_id,
+        )
+        return
+
+    if data == REQUEST_CALLBACK_VENUE_CUSTOM:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        state = get_runtime_state(context, user_id)
+        state.pending_action = PENDING_REQUEST_VENUE
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text="Шаг 1/7: введите ID площадки (venue ID).",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    if data == REQUEST_CALLBACK_REPRESENTATIVE_DEFAULT:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        state = get_runtime_state(context, user_id)
+        draft = state.request_draft
+        if draft is None or draft.default_representative_id is None:
+            await query.answer("Представитель по умолчанию не найден.", show_alert=True)
+            return
+
+        draft.representative_id = draft.default_representative_id
+        state.pending_action = PENDING_REQUEST_DATE
+        await query.answer("Представитель выбран.")
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text="Шаг 3/7: введите дату и время проведения в формате YYYY-MM-DD HH:MM (UTC+7).",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    if data == REQUEST_CALLBACK_REPRESENTATIVE_CUSTOM:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        state = get_runtime_state(context, user_id)
+        state.pending_action = PENDING_REQUEST_REPRESENTATIVE
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text="Шаг 2/7: введите ID представителя.",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
     if data == "poll:create":
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
@@ -761,15 +972,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == DATE_CALLBACK_IGNORE:
         await query.answer()
-        return
-
-    if data == DATE_CALLBACK_MANUAL:
-        state = get_runtime_state(context, user_id)
-        state.pending_action = PENDING_REPRESENTATIVE_DATE
-        await query.answer()
-        await query.edit_message_text(
-            "Введите дату в формате YYYY-MM-DD (например, 2026-03-10)."
-        )
         return
 
     if data.startswith(DATE_CALLBACK_PICK_PREFIX):
@@ -788,6 +990,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             target_date = date.fromisoformat(raw_date)
         except ValueError:
             await query.answer("Некорректная дата.", show_alert=True)
+            return
+
+        today = date.today()
+        max_day = today + timedelta(days=DATE_PICKER_DAYS - 1)
+        if target_date < today or target_date > max_day:
+            await query.answer("Можно выбрать только дату из ближайших 60 дней.", show_alert=True)
             return
 
         await query.answer(f"Выбрана дата: {target_date.isoformat()}")
@@ -883,16 +1091,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         storage.upsert_rating_email(user_id, state.temp_email)
         storage.upsert_rating_token(user_id, token)
+        player = user_data.get("player") if isinstance(user_data, dict) else None
+        player_id: int | None = None
+        player_name: str | None = None
+        if isinstance(player, dict):
+            raw_id = player.get("id")
+            if isinstance(raw_id, int):
+                player_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.isdigit():
+                player_id = int(raw_id)
+
+            formatted_name = format_player_name(player)
+            if formatted_name and formatted_name != "Неизвестный редактор":
+                player_name = formatted_name
+        storage.upsert_player_profile(
+            user_id,
+            player_id=player_id,
+            player_name=player_name,
+        )
 
         state.pending_action = None
         state.temp_email = None
+        state.site_password = password
 
         try:
             await update.message.delete()
         except Exception:
             pass
 
-        player = user_data.get("player") if isinstance(user_data, dict) else None
         player_label = ""
         if isinstance(player, dict):
             player_label = format_player_name(player)
@@ -903,29 +1129,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             text=f"Авторизация успешна.{suffix}",
             reply_markup=main_menu_markup(context, user_id),
         )
-        return
-
-    if state.pending_action == PENDING_REPRESENTATIVE_DATE:
-        try:
-            target_date = date.fromisoformat(text)
-        except ValueError:
-            await update.message.reply_text("Некорректная дата. Нужен формат YYYY-MM-DD.")
-            return
-
-        try:
-            await send_tournaments_for_date(
-                context=context,
-                chat_id=update.effective_chat.id,
-                user_id=user_id,
-                target_date=target_date,
-            )
-        except RatingApiError as exc:
-            await notify_tournaments_error(
-                context=context,
-                chat_id=update.effective_chat.id,
-                user_id=user_id,
-                exc=exc,
-            )
         return
 
     if state.pending_action == PENDING_REQUEST_TOURNAMENT:
@@ -942,8 +1145,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         state.request_draft.tournament_id = tournament_id
-        state.pending_action = PENDING_REQUEST_VENUE
-        await update.message.reply_text("Шаг 1/6: введите ID площадки (venue ID).")
+        await load_request_prefill(
+            context=context,
+            user_id=user_id,
+            tournament_id=tournament_id,
+        )
+        await prompt_request_venue_step(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+        )
         return
 
     if state.pending_action == PENDING_REQUEST_VENUE:
@@ -962,16 +1173,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         state.request_draft.venue_id = venue_id
+        state.request_draft.default_venue_id = venue_id
+        state.request_draft.default_venue_label = f"ID {venue_id}"
+        await prompt_request_representative_step(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+        )
+        return
+
+    if state.pending_action == PENDING_REQUEST_REPRESENTATIVE:
+        if state.request_draft is None or state.request_draft.venue_id is None:
+            state.pending_action = PENDING_REQUEST_VENUE
+            await update.message.reply_text("Сначала укажите площадку.")
+            return
+
+        if not text.isdigit():
+            await update.message.reply_text("ID представителя должен быть числом.")
+            return
+
+        representative_id = int(text)
+        if representative_id <= 0:
+            await update.message.reply_text("ID представителя должен быть положительным числом.")
+            return
+
+        state.request_draft.representative_id = representative_id
         state.pending_action = PENDING_REQUEST_DATE
         await update.message.reply_text(
-            "Шаг 2/6: введите дату и время проведения в формате YYYY-MM-DD HH:MM (UTC+7)."
+            "Шаг 3/7: введите дату и время проведения в формате YYYY-MM-DD HH:MM (UTC+7)."
         )
         return
 
     if state.pending_action == PENDING_REQUEST_DATE:
-        if state.request_draft is None or state.request_draft.venue_id is None:
-            state.pending_action = PENDING_REQUEST_VENUE
-            await update.message.reply_text("Сначала укажите ID площадки.")
+        if (
+            state.request_draft is None
+            or state.request_draft.venue_id is None
+            or state.request_draft.representative_id is None
+        ):
+            state.pending_action = PENDING_REQUEST_REPRESENTATIVE
+            await update.message.reply_text("Сначала укажите представителя.")
             return
 
         try:
@@ -982,8 +1222,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         state.request_draft.date_start = date_start
         state.pending_action = PENDING_REQUEST_TEAMS
+        teams_default = ""
+        if state.request_draft.approximate_teams_count is not None:
+            teams_default = f" (по умолчанию: {state.request_draft.approximate_teams_count})"
         await update.message.reply_text(
-            "Шаг 3/6: примерное количество команд (число) или «-», чтобы пропустить."
+            f"Шаг 4/7: примерное количество команд (число) или «-», чтобы пропустить{teams_default}."
         )
         return
 
@@ -1006,7 +1249,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             state.request_draft.approximate_teams_count = teams_count
 
         state.pending_action = PENDING_REQUEST_NARRATOR
-        await update.message.reply_text("Шаг 4/6: ID ведущего (narrator) или «-», если не указывать.")
+        await update.message.reply_text("Шаг 5/7: ID ведущего (чтеца).")
         return
 
     if state.pending_action == PENDING_REQUEST_NARRATOR:
@@ -1015,20 +1258,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Черновик заявки потерян. Начните снова: /request")
             return
 
-        if text.casefold() in SKIP_MARKERS:
-            state.request_draft.narrator_id = None
-        else:
-            if not text.isdigit():
-                await update.message.reply_text("Нужно число (ID ведущего) или «-».")
-                return
-            narrator_id = int(text)
-            if narrator_id <= 0:
-                await update.message.reply_text("ID ведущего должен быть положительным.")
-                return
-            state.request_draft.narrator_id = narrator_id
+        if not text.isdigit():
+            await update.message.reply_text("Нужно число (ID ведущего).")
+            return
+        narrator_id = int(text)
+        if narrator_id <= 0:
+            await update.message.reply_text("ID ведущего должен быть положительным.")
+            return
+        state.request_draft.narrator_id = narrator_id
 
         state.pending_action = PENDING_REQUEST_COMMENT
-        await update.message.reply_text("Шаг 5/6: комментарий или «-», чтобы пропустить.")
+        await update.message.reply_text("Шаг 6/7: комментарий или «-», чтобы пропустить.")
         return
 
     if state.pending_action == PENDING_REQUEST_COMMENT:
@@ -1044,7 +1284,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         email_label = persisted.rating_email or "(не указан)"
         await update.message.reply_text(
             (
-                "Шаг 6/6: введите пароль от rating.chgk.info для отправки заявки.\n"
+                "Шаг 7/7: введите пароль от rating.chgk.info для отправки заявки.\n"
                 f"Используется email: {email_label}\n"
                 "Если нужен другой аккаунт, сначала выполните «Авторизация»."
             )
@@ -1061,7 +1301,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if (
             draft.tournament_id is None
             or draft.venue_id is None
+            or draft.representative_id is None
             or draft.date_start is None
+            or draft.narrator_id is None
         ):
             state.pending_action = None
             await update.message.reply_text("Черновик заявки неполный. Начните снова: /request")
@@ -1076,6 +1318,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         rating_site = get_rating_site(context)
         password = text
+        state.site_password = password
         try:
             await update.message.delete()
         except Exception:
@@ -1089,6 +1332,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 password=password,
                 tournament_id=draft.tournament_id,
                 venue_id=draft.venue_id,
+                representative_id=draft.representative_id,
                 date_start=draft.date_start,
                 approximate_teams_count=draft.approximate_teams_count,
                 narrator_id=draft.narrator_id,
@@ -1106,6 +1350,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(f"Не удалось отправить заявку: {exc}")
             return
 
+        storage.upsert_default_venue(
+            user_id,
+            venue_id=draft.venue_id,
+            venue_label=draft.default_venue_label or f"ID {draft.venue_id}",
+        )
         reset_request_draft(state)
         await update.message.reply_text(
             f"{result.message}\nURL: {result.final_url}",

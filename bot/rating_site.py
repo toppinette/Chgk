@@ -26,6 +26,15 @@ class RequestFormData:
     fields: dict[str, str]
 
 
+@dataclass(slots=True)
+class RequestPrefill:
+    venue_id: Optional[int] = None
+    venue_label: Optional[str] = None
+    representative_id: Optional[int] = None
+    representative_label: Optional[str] = None
+    approximate_teams_count: Optional[int] = None
+
+
 class RatingSiteClient:
     def __init__(self, base_url: str, timeout_seconds: float = 20.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -38,6 +47,7 @@ class RatingSiteClient:
         password: str,
         tournament_id: int,
         venue_id: int,
+        representative_id: Optional[int],
         date_start: str,
         approximate_teams_count: Optional[int],
         narrator_id: Optional[int],
@@ -67,6 +77,7 @@ class RatingSiteClient:
                     form_data.fields,
                     tournament_id=tournament_id,
                     venue_id=venue_id,
+                    representative_id=representative_id,
                     date_start=date_start,
                     approximate_teams_count=approximate_teams_count,
                     narrator_id=narrator_id,
@@ -90,6 +101,35 @@ class RatingSiteClient:
                     final_url=submit_url,
                     message="Заявка отправлена. Проверьте статус на странице турнира.",
                 )
+        except aiohttp.ClientError as exc:
+            raise RatingSiteError(f"Ошибка соединения с сайтом rating: {exc}") from exc
+        except TimeoutError as exc:
+            raise RatingSiteError("Таймаут при обращении к сайту rating") from exc
+
+    async def get_request_prefill(
+        self,
+        *,
+        email: str,
+        password: str,
+        tournament_id: int,
+    ) -> RequestPrefill:
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        cookie_jar = aiohttp.CookieJar()
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                cookie_jar=cookie_jar,
+                headers=self._build_default_headers(),
+            ) as session:
+                await self._login(session, email=email, password=password)
+                form_url = f"{self.base_url}/tournament/request?tournamentId={tournament_id}"
+                form_html, _ = await self._get_text(
+                    session,
+                    form_url,
+                    stage="request_prefill_get",
+                )
+                return self._extract_request_prefill(form_html)
         except aiohttp.ClientError as exc:
             raise RatingSiteError(f"Ошибка соединения с сайтом rating: {exc}") from exc
         except TimeoutError as exc:
@@ -396,27 +436,111 @@ class RatingSiteClient:
             raise RatingSiteError("Форма заявки не найдена на странице турнира.")
         return form
 
+    def _extract_request_prefill(self, html: str) -> RequestPrefill:
+        soup = BeautifulSoup(html, "html.parser")
+        form = self._find_target_form(soup, action_suffix="/tournament/request")
+        if form is None:
+            return RequestPrefill()
+
+        venue_id, venue_label = self._extract_selected_option(
+            form=form,
+            candidate_tokens=("venue",),
+        )
+        representative_id, representative_label = self._extract_selected_option(
+            form=form,
+            candidate_tokens=("representative",),
+        )
+        approximate_teams_count = self._extract_integer_input(
+            form=form,
+            candidate_tokens=(("approximate", "teams"), ("teams", "count")),
+        )
+
+        return RequestPrefill(
+            venue_id=venue_id,
+            venue_label=venue_label,
+            representative_id=representative_id,
+            representative_label=representative_label,
+            approximate_teams_count=approximate_teams_count,
+        )
+
     def _extract_form(self, html: str, page_url: str, *, action_suffix: str) -> RequestFormData:
         soup = BeautifulSoup(html, "html.parser")
-        forms = soup.find_all("form")
-        if not forms:
-            raise RatingSiteError("На странице не найдена форма.")
-
-        target_form: Optional[Tag] = None
-        for form in forms:
-            action = str(form.get("action") or "")
-            if action.endswith(action_suffix) or action_suffix in action:
-                target_form = form
-                break
-
+        target_form = self._find_target_form(soup, action_suffix=action_suffix)
         if target_form is None:
-            target_form = forms[0]
+            raise RatingSiteError("На странице не найдена форма.")
 
         action = str(target_form.get("action") or "").strip()
         method = str(target_form.get("method") or "GET").strip().upper() or "GET"
         action_url = self._resolve_form_action(page_url, action)
         fields = self._collect_form_fields(target_form)
         return RequestFormData(action_url=action_url, method=method, fields=fields)
+
+    def _find_target_form(self, soup: BeautifulSoup, *, action_suffix: str) -> Optional[Tag]:
+        forms = soup.find_all("form")
+        if not forms:
+            return None
+
+        for form in forms:
+            action = str(form.get("action") or "")
+            if action.endswith(action_suffix) or action_suffix in action:
+                return form
+
+        return forms[0]
+
+    def _extract_selected_option(
+        self,
+        *,
+        form: Tag,
+        candidate_tokens: tuple[str, ...],
+    ) -> tuple[Optional[int], Optional[str]]:
+        select_tag: Optional[Tag] = None
+        for candidate in form.find_all("select"):
+            if not isinstance(candidate, Tag):
+                continue
+            name = str(candidate.get("name") or "").strip().lower()
+            if not name:
+                continue
+            normalized = name.replace("_", "")
+            if all(token in normalized for token in candidate_tokens):
+                select_tag = candidate
+                break
+
+        if select_tag is None:
+            return None, None
+
+        selected_option = select_tag.find("option", selected=True)
+        if selected_option is None:
+            selected_option = select_tag.find("option")
+        if selected_option is None:
+            return None, None
+
+        value = str(selected_option.get("value") or "").strip()
+        label = selected_option.get_text(" ", strip=True) or None
+        if not value.isdigit():
+            return None, label
+        return int(value), label
+
+    def _extract_integer_input(
+        self,
+        *,
+        form: Tag,
+        candidate_tokens: tuple[tuple[str, ...], ...],
+    ) -> Optional[int]:
+        for input_tag in form.find_all("input"):
+            if not isinstance(input_tag, Tag):
+                continue
+            name = str(input_tag.get("name") or "").strip()
+            if not name:
+                continue
+            normalized = name.lower().replace("_", "")
+            if not any(all(token in normalized for token in tokens) for tokens in candidate_tokens):
+                continue
+
+            value = str(input_tag.get("value") or "").strip()
+            if value.isdigit():
+                return int(value)
+
+        return None
 
     def _resolve_form_action(self, page_url: str, action: str) -> str:
         raw_action = (action or "").strip()
@@ -496,6 +620,7 @@ class RatingSiteClient:
         *,
         tournament_id: int,
         venue_id: int,
+        representative_id: Optional[int],
         date_start: str,
         approximate_teams_count: Optional[int],
         narrator_id: Optional[int],
@@ -503,6 +628,8 @@ class RatingSiteClient:
     ) -> None:
         self._set_field_value(fields, ("tournament", "id"), str(tournament_id))
         self._set_field_value(fields, ("venue",), str(venue_id), required=True)
+        if representative_id is not None:
+            self._set_field_value(fields, ("representative",), str(representative_id), required=True)
         self._set_field_value(fields, ("date", "start"), date_start, required=True)
 
         if approximate_teams_count is not None:
@@ -514,7 +641,7 @@ class RatingSiteClient:
             self._set_field_value(fields, ("teams", "count"), str(approximate_teams_count))
 
         if narrator_id is not None:
-            self._set_field_value(fields, ("narrator",), str(narrator_id))
+            self._set_field_value(fields, ("narrator",), str(narrator_id), required=True)
             self._set_field_value(fields, ("host",), str(narrator_id))
 
         if comment:
