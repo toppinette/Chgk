@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import re
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
+
+logger = logging.getLogger(__name__)
 
 
 class RatingSiteError(Exception):
@@ -97,6 +100,13 @@ class RatingSiteClient:
                     narrator_id=narrator_id,
                     comment=comment,
                 )
+                logger.info(
+                    "rating_submit start tournament_id=%s action=%s method=%s fields=%s",
+                    tournament_id,
+                    urlparse(form_data.action_url).path or "/",
+                    form_data.method,
+                    self._request_field_snapshot(form_data.fields),
+                )
 
                 submit_html, submit_url = await self._submit_request_with_fallback(
                     session=session,
@@ -120,6 +130,17 @@ class RatingSiteClient:
                     explicit_request_id=request_id,
                     before_request_ids=before_request_ids,
                     after_request_ids=after_request_ids,
+                )
+                submit_path = urlparse(submit_url).path or "/"
+                submit_messages = self._extract_form_messages(submit_html)
+                logger.info(
+                    "rating_submit first_result tournament_id=%s path=%s request_id=%s success_marker=%s form_like=%s messages=%s",
+                    tournament_id,
+                    submit_path,
+                    request_id,
+                    self._has_success_marker(submit_html),
+                    self._looks_like_request_form_page(submit_url, submit_html),
+                    submit_messages[:3],
                 )
 
                 is_confirmed = request_id is not None
@@ -154,6 +175,16 @@ class RatingSiteClient:
                         before_request_ids=before_request_ids,
                         after_request_ids=after_request_ids,
                     )
+                    retry_path = urlparse(submit_url).path or "/"
+                    retry_messages = self._extract_form_messages(submit_html)
+                    logger.info(
+                        "rating_submit retry_result tournament_id=%s path=%s request_id=%s success_marker=%s messages=%s",
+                        tournament_id,
+                        retry_path,
+                        request_id,
+                        self._has_success_marker(submit_html),
+                        retry_messages[:3],
+                    )
                     is_confirmed = request_id is not None
                     if not is_confirmed and self._has_success_marker(submit_html):
                         is_confirmed = True
@@ -161,11 +192,21 @@ class RatingSiteClient:
                     before_count = len(before_request_ids) if before_request_ids is not None else "?"
                     after_count = len(after_request_ids) if after_request_ids is not None else "?"
                     final_path = urlparse(submit_url).path or "/"
+                    messages = self._extract_form_messages(submit_html)
+                    detail = f" Детали формы: {' | '.join(messages[:3])}." if messages else ""
+                    logger.warning(
+                        "rating_submit unconfirmed tournament_id=%s path=%s before=%s after=%s messages=%s",
+                        tournament_id,
+                        final_path,
+                        before_count,
+                        after_count,
+                        messages[:5],
+                    )
                     raise RatingSiteError(
                         "Сайт не подтвердил отправку заявки "
                         f"(path={final_path}, api_requests_before={before_count}, "
                         f"api_requests_after={after_count}). "
-                        "Проверьте обязательные поля в форме."
+                        f"Проверьте обязательные поля в форме.{detail}"
                     )
 
                 if request_id is not None:
@@ -303,9 +344,19 @@ class RatingSiteClient:
                 headers={"Accept": "application/json"},
             ) as response:
                 if response.status >= 400:
+                    logger.warning(
+                        "rating_submit api_requests_failed tournament_id=%s status=%s",
+                        tournament_id,
+                        response.status,
+                    )
                     return None
                 data = await response.json(content_type=None)
                 if not isinstance(data, list):
+                    logger.warning(
+                        "rating_submit api_requests_invalid tournament_id=%s payload_type=%s",
+                        tournament_id,
+                        type(data).__name__,
+                    )
                     return None
                 ids: set[int] = set()
                 for row in data:
@@ -316,8 +367,18 @@ class RatingSiteClient:
                         ids.add(request_id)
                     elif isinstance(request_id, str) and request_id.isdigit():
                         ids.add(int(request_id))
+                logger.info(
+                    "rating_submit api_requests tournament_id=%s count=%s",
+                    tournament_id,
+                    len(ids),
+                )
                 return ids
-        except (aiohttp.ClientError, ValueError, TypeError):
+        except (aiohttp.ClientError, ValueError, TypeError) as exc:
+            logger.warning(
+                "rating_submit api_requests_error tournament_id=%s error=%s",
+                tournament_id,
+                exc,
+            )
             return None
 
     def _resolve_request_id(
@@ -916,3 +977,76 @@ class RatingSiteClient:
 
         if messages:
             raise RatingSiteError(messages[0])
+
+    def _extract_form_messages(self, html: str) -> list[str]:
+        if not html:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        selectors = (
+            ".alert-danger",
+            ".alert-warning",
+            ".alert-info",
+            ".form-error-message",
+            ".invalid-feedback",
+            ".error",
+            "#error_message",
+            ".text-danger",
+            ".parsley-errors-list li",
+            ".help-block",
+        )
+        messages: list[str] = []
+        seen: set[str] = set()
+        for selector in selectors:
+            for node in soup.select(selector):
+                text = node.get_text(" ", strip=True)
+                if not text:
+                    continue
+                normalized = " ".join(text.split())
+                if len(normalized) > 220:
+                    normalized = normalized[:220] + "..."
+                key = normalized.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                messages.append(normalized)
+
+        if messages:
+            return messages
+
+        text_blob = " ".join(soup.get_text(" ", strip=True).split()).casefold()
+        fallback_hits = [
+            "обязател",
+            "необходимо",
+            "ошибк",
+            "неверн",
+            "заполните",
+            "недостаточно прав",
+        ]
+        if any(token in text_blob for token in fallback_hits):
+            return [text_blob[:220] + ("..." if len(text_blob) > 220 else "")]
+        return []
+
+    def _request_field_snapshot(self, fields: dict[str, str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        watched = {
+            "tournament": ("tournament", "id"),
+            "venue": ("venue",),
+            "representative": ("representative",),
+            "date_start": ("date", "start"),
+            "narrator": ("narrator",),
+            "teams": ("teams", "count"),
+        }
+        for label, tokens in watched.items():
+            key = self._find_field(fields, tokens)
+            if key is None:
+                result[label] = "missing"
+                continue
+            value = (fields.get(key) or "").strip()
+            if not value:
+                result[label] = "empty"
+                continue
+            if value.isdigit():
+                result[label] = value
+            else:
+                result[label] = "set"
+        return result
