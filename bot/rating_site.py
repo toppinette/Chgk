@@ -768,7 +768,12 @@ class RatingSiteClient:
         self._set_field_value(fields, ("tournament", "id"), str(tournament_id))
         self._set_field_value(fields, ("venue",), str(venue_id), required=True)
         if representative_id is not None:
-            self._set_field_value(fields, ("representative",), str(representative_id), required=True)
+            # Some request forms do not expose representative as a standalone field:
+            # server-side default representative is used from the authenticated user.
+            # Try to set it when present, but do not fail submit if field is absent.
+            self._set_field_value(fields, ("representative",), str(representative_id))
+            self._set_field_value(fields, ("idplayer",), str(representative_id))
+            self._set_field_value(fields, ("player",), str(representative_id))
         self._set_field_value(fields, ("date", "start"), date_start, required=True)
 
         if approximate_teams_count is not None:
