@@ -147,47 +147,61 @@ class RatingSiteClient:
                 if not is_confirmed and self._has_success_marker(submit_html):
                     # Fallback: UI may show server-side success message without requestId.
                     is_confirmed = True
-                if (
-                    not is_confirmed
-                    and self._looks_like_request_form_page(submit_url, submit_html)
-                ):
-                    # Some pages expose GET in HTML while real submit must be POST.
-                    retry_html, retry_url = await self._submit_request_with_fallback(
-                        session=session,
-                        action_url=form_data.action_url,
-                        form_method=form_data.method,
-                        form_fields=form_data.fields,
+                if not is_confirmed:
+                    # The first non-error response is not always the real submit result.
+                    # Force fallback submit variants and confirm again.
+                    fallback_url = self._build_request_fallback_url(
+                        tournament_id=tournament_id,
                         referer=resolved_form_url,
-                        tournament_id=tournament_id,
-                        request_candidates=request_candidates,
-                        prefer_post=True,
                     )
-                    self._raise_if_login_page(retry_url, retry_html)
-                    self._raise_if_site_error(retry_html)
-                    submit_html, submit_url = retry_html, retry_url
-                    request_id = self._extract_request_id(submit_url, submit_html)
-                    after_request_ids = await self._safe_get_request_ids_from_api(
-                        session=session,
-                        tournament_id=tournament_id,
-                    )
-                    request_id = self._resolve_request_id(
-                        explicit_request_id=request_id,
-                        before_request_ids=before_request_ids,
-                        after_request_ids=after_request_ids,
-                    )
-                    retry_path = urlparse(submit_url).path or "/"
-                    retry_messages = self._extract_form_messages(submit_html)
-                    logger.info(
-                        "rating_submit retry_result tournament_id=%s path=%s request_id=%s success_marker=%s messages=%s",
-                        tournament_id,
-                        retry_path,
-                        request_id,
-                        self._has_success_marker(submit_html),
-                        retry_messages[:3],
-                    )
-                    is_confirmed = request_id is not None
-                    if not is_confirmed and self._has_success_marker(submit_html):
-                        is_confirmed = True
+                    for attempt_method in ("POST", "GET"):
+                        try:
+                            retry_html, retry_url = await self._submit_form(
+                                session=session,
+                                method=attempt_method,
+                                action_url=fallback_url,
+                                fields=form_data.fields,
+                                referer=resolved_form_url,
+                                stage=f"request_submit_forced_{attempt_method.lower()}",
+                            )
+                        except RatingSiteError as exc:
+                            logger.info(
+                                "rating_submit forced_attempt_failed tournament_id=%s method=%s url=%s error=%s",
+                                tournament_id,
+                                attempt_method,
+                                self._url_path_and_query(fallback_url),
+                                exc,
+                            )
+                            continue
+
+                        self._raise_if_login_page(retry_url, retry_html)
+                        self._raise_if_site_error(retry_html)
+                        submit_html, submit_url = retry_html, retry_url
+                        request_id = self._extract_request_id(submit_url, submit_html)
+                        after_request_ids = await self._safe_get_request_ids_from_api(
+                            session=session,
+                            tournament_id=tournament_id,
+                        )
+                        request_id = self._resolve_request_id(
+                            explicit_request_id=request_id,
+                            before_request_ids=before_request_ids,
+                            after_request_ids=after_request_ids,
+                        )
+                        retry_messages = self._extract_form_messages(submit_html)
+                        is_confirmed = request_id is not None
+                        if not is_confirmed and self._has_success_marker(submit_html):
+                            is_confirmed = True
+                        logger.info(
+                            "rating_submit forced_result tournament_id=%s method=%s path=%s request_id=%s success_marker=%s messages=%s",
+                            tournament_id,
+                            attempt_method,
+                            self._url_path_and_query(submit_url),
+                            request_id,
+                            self._has_success_marker(submit_html),
+                            retry_messages[:3],
+                        )
+                        if is_confirmed:
+                            break
                 if not is_confirmed:
                     before_count = len(before_request_ids) if before_request_ids is not None else "?"
                     after_count = len(after_request_ids) if after_request_ids is not None else "?"
@@ -460,6 +474,12 @@ class RatingSiteClient:
             if "/tournament/request" in action or action.endswith("/request"):
                 return True
         return False
+
+    def _url_path_and_query(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.query:
+            return f"{parsed.path or '/'}?{parsed.query}"
+        return parsed.path or "/"
 
     def _extract_request_candidates(self, html: str) -> list[str]:
         if not html:
