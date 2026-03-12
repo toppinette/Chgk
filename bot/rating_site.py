@@ -36,9 +36,15 @@ class RequestPrefill:
 
 
 class RatingSiteClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 20.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 20.0,
+        requests_api_base_url: str = "https://api.rating.chgk.info",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.requests_api_base_url = requests_api_base_url.rstrip("/")
 
     async def submit_tournament_request(
         self,
@@ -77,9 +83,9 @@ class RatingSiteClient:
                     submit_url=resolved_form_url,
                     tournament_id=tournament_id,
                 )
-                before_request_ids = await self._safe_get_request_ids(
+                before_request_ids = await self._safe_get_request_ids_from_api(
                     session=session,
-                    requests_url=requests_url,
+                    tournament_id=tournament_id,
                 )
                 self._fill_request_form(
                     form_data.fields,
@@ -100,14 +106,15 @@ class RatingSiteClient:
                     referer=resolved_form_url,
                     tournament_id=tournament_id,
                     request_candidates=request_candidates,
+                    prefer_post=False,
                 )
 
                 self._raise_if_login_page(submit_url, submit_html)
                 self._raise_if_site_error(submit_html)
                 request_id = self._extract_request_id(submit_url, submit_html)
-                after_request_ids = await self._safe_get_request_ids(
+                after_request_ids = await self._safe_get_request_ids_from_api(
                     session=session,
-                    requests_url=requests_url,
+                    tournament_id=tournament_id,
                 )
                 request_id = self._resolve_request_id(
                     explicit_request_id=request_id,
@@ -119,13 +126,45 @@ class RatingSiteClient:
                 if not is_confirmed and self._has_success_marker(submit_html):
                     # Fallback: UI may show server-side success message without requestId.
                     is_confirmed = True
+                if (
+                    not is_confirmed
+                    and self._looks_like_request_form_page(submit_url, submit_html)
+                ):
+                    # Some pages expose GET in HTML while real submit must be POST.
+                    retry_html, retry_url = await self._submit_request_with_fallback(
+                        session=session,
+                        action_url=form_data.action_url,
+                        form_method=form_data.method,
+                        form_fields=form_data.fields,
+                        referer=resolved_form_url,
+                        tournament_id=tournament_id,
+                        request_candidates=request_candidates,
+                        prefer_post=True,
+                    )
+                    self._raise_if_login_page(retry_url, retry_html)
+                    self._raise_if_site_error(retry_html)
+                    submit_html, submit_url = retry_html, retry_url
+                    request_id = self._extract_request_id(submit_url, submit_html)
+                    after_request_ids = await self._safe_get_request_ids_from_api(
+                        session=session,
+                        tournament_id=tournament_id,
+                    )
+                    request_id = self._resolve_request_id(
+                        explicit_request_id=request_id,
+                        before_request_ids=before_request_ids,
+                        after_request_ids=after_request_ids,
+                    )
+                    is_confirmed = request_id is not None
+                    if not is_confirmed and self._has_success_marker(submit_html):
+                        is_confirmed = True
                 if not is_confirmed:
                     before_count = len(before_request_ids) if before_request_ids is not None else "?"
                     after_count = len(after_request_ids) if after_request_ids is not None else "?"
                     final_path = urlparse(submit_url).path or "/"
                     raise RatingSiteError(
                         "Сайт не подтвердил отправку заявки "
-                        f"(path={final_path}, requests_before={before_count}, requests_after={after_count}). "
+                        f"(path={final_path}, api_requests_before={before_count}, "
+                        f"api_requests_after={after_count}). "
                         "Проверьте обязательные поля в форме."
                     )
 
@@ -185,13 +224,18 @@ class RatingSiteClient:
         referer: str,
         tournament_id: int,
         request_candidates: list[str],
+        prefer_post: bool = False,
     ) -> tuple[str, str]:
         normalized_method = (form_method or "GET").strip().upper() or "GET"
-        method_variants = [normalized_method]
-        if normalized_method == "GET":
-            method_variants.append("POST")
-        elif normalized_method == "POST":
-            method_variants.append("GET")
+        method_variants: list[str] = []
+        if prefer_post:
+            method_variants = ["POST", "GET"]
+        else:
+            method_variants = [normalized_method]
+            if normalized_method == "GET":
+                method_variants.append("POST")
+            elif normalized_method == "POST":
+                method_variants.append("GET")
 
         fallback_url = self._build_request_fallback_url(
             tournament_id=tournament_id,
@@ -245,32 +289,36 @@ class RatingSiteClient:
         base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else self.base_url
         return f"{base}/tournament/{tournament_id}/requests"
 
-    async def _safe_get_request_ids(
+    async def _safe_get_request_ids_from_api(
         self,
         *,
         session: aiohttp.ClientSession,
-        requests_url: str,
+        tournament_id: int,
     ) -> Optional[set[int]]:
         try:
-            html, _ = await self._get_text(
-                session,
-                requests_url,
-                stage="request_list_get",
-            )
-        except RatingSiteError:
+            api_url = f"{self.requests_api_base_url}/tournaments/{tournament_id}/requests"
+            async with session.get(
+                api_url,
+                allow_redirects=True,
+                headers={"Accept": "application/json"},
+            ) as response:
+                if response.status >= 400:
+                    return None
+                data = await response.json(content_type=None)
+                if not isinstance(data, list):
+                    return None
+                ids: set[int] = set()
+                for row in data:
+                    if not isinstance(row, dict):
+                        continue
+                    request_id = row.get("id")
+                    if isinstance(request_id, int):
+                        ids.add(request_id)
+                    elif isinstance(request_id, str) and request_id.isdigit():
+                        ids.add(int(request_id))
+                return ids
+        except (aiohttp.ClientError, ValueError, TypeError):
             return None
-        return self._extract_request_ids_from_html(html)
-
-    def _extract_request_ids_from_html(self, html: str) -> set[int]:
-        ids: set[int] = set()
-        if not html:
-            return ids
-        for match in re.finditer(r"requestId=(\d+)", html):
-            try:
-                ids.add(int(match.group(1)))
-            except (TypeError, ValueError):
-                continue
-        return ids
 
     def _resolve_request_id(
         self,
@@ -338,6 +386,19 @@ class RatingSiteClient:
                 "заявка принята",
             )
         )
+
+    def _looks_like_request_form_page(self, submit_url: str, html: str) -> bool:
+        if not html:
+            return False
+        path = urlparse(submit_url).path.rstrip("/")
+        if path != "/tournament/request":
+            return False
+        soup = BeautifulSoup(html, "html.parser")
+        for form in soup.find_all("form"):
+            action = str(form.get("action") or "")
+            if "/tournament/request" in action or action.endswith("/request"):
+                return True
+        return False
 
     def _extract_request_candidates(self, html: str) -> list[str]:
         if not html:
