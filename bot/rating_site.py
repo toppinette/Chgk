@@ -90,10 +90,17 @@ class RatingSiteClient:
                     session=session,
                     tournament_id=tournament_id,
                 )
+                venue_context = await self._safe_get_venue_context(
+                    session=session,
+                    venue_id=venue_id,
+                )
                 self._fill_request_form(
                     form_data.fields,
                     tournament_id=tournament_id,
                     venue_id=venue_id,
+                    town_id=venue_context.get("town_id"),
+                    region_id=venue_context.get("region_id"),
+                    country_id=venue_context.get("country_id"),
                     representative_id=representative_id,
                     date_start=date_start,
                     approximate_teams_count=approximate_teams_count,
@@ -394,6 +401,76 @@ class RatingSiteClient:
                 exc,
             )
             return None
+
+    async def _safe_get_venue_context(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        venue_id: int,
+    ) -> dict[str, Optional[int]]:
+        result: dict[str, Optional[int]] = {
+            "town_id": None,
+            "region_id": None,
+            "country_id": None,
+        }
+        api_url = f"{self.requests_api_base_url}/venues/{venue_id}"
+        try:
+            async with session.get(
+                api_url,
+                allow_redirects=True,
+                headers={"Accept": "application/json"},
+            ) as response:
+                if response.status >= 400:
+                    logger.warning(
+                        "rating_submit venue_context_failed venue_id=%s status=%s",
+                        venue_id,
+                        response.status,
+                    )
+                    return result
+                data = await response.json(content_type=None)
+        except (aiohttp.ClientError, ValueError, TypeError) as exc:
+            logger.warning(
+                "rating_submit venue_context_error venue_id=%s error=%s",
+                venue_id,
+                exc,
+            )
+            return result
+
+        if not isinstance(data, dict):
+            return result
+
+        town = data.get("town")
+        if isinstance(town, dict):
+            town_id = town.get("id")
+            if isinstance(town_id, int):
+                result["town_id"] = town_id
+
+            region = town.get("region")
+            if isinstance(region, dict):
+                region_id = region.get("id")
+                if isinstance(region_id, int):
+                    result["region_id"] = region_id
+
+                country = region.get("country")
+                if isinstance(country, dict):
+                    country_id = country.get("id")
+                    if isinstance(country_id, int):
+                        result["country_id"] = country_id
+
+            country = town.get("country")
+            if isinstance(country, dict) and result["country_id"] is None:
+                country_id = country.get("id")
+                if isinstance(country_id, int):
+                    result["country_id"] = country_id
+
+        logger.info(
+            "rating_submit venue_context venue_id=%s town_id=%s region_id=%s country_id=%s",
+            venue_id,
+            result["town_id"],
+            result["region_id"],
+            result["country_id"],
+        )
+        return result
 
     def _resolve_request_id(
         self,
@@ -901,6 +978,9 @@ class RatingSiteClient:
         *,
         tournament_id: int,
         venue_id: int,
+        town_id: Optional[int],
+        region_id: Optional[int],
+        country_id: Optional[int],
         representative_id: Optional[int],
         date_start: str,
         approximate_teams_count: Optional[int],
@@ -909,6 +989,15 @@ class RatingSiteClient:
     ) -> None:
         self._set_field_value(fields, ("tournament", "id"), str(tournament_id))
         self._set_field_value(fields, ("venue",), str(venue_id), required=True)
+        if town_id is not None:
+            self._set_field_value(fields, ("idtown",), str(town_id))
+            self._set_field_value(fields, ("town",), str(town_id))
+        if region_id is not None:
+            self._set_field_value(fields, ("idregion",), str(region_id))
+            self._set_field_value(fields, ("region",), str(region_id))
+        if country_id is not None:
+            self._set_field_value(fields, ("idcountry",), str(country_id))
+            self._set_field_value(fields, ("country",), str(country_id))
         if representative_id is not None:
             # Some request forms do not expose representative as a standalone field:
             # server-side default representative is used from the authenticated user.
@@ -1051,6 +1140,7 @@ class RatingSiteClient:
         watched = {
             "tournament": ("tournament", "id"),
             "venue": ("venue",),
+            "town": ("town",),
             "representative": ("representative",),
             "date_start": ("date", "start"),
             "narrator": ("narrator",),
