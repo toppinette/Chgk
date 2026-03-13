@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import re
 from typing import Any, Optional
@@ -115,20 +116,34 @@ class RatingSiteClient:
                     self._request_field_snapshot(form_data.fields),
                 )
 
-                submit_html, submit_url = await self._submit_request_with_fallback(
-                    session=session,
-                    action_url=form_data.action_url,
-                    form_method=form_data.method,
-                    form_fields=form_data.fields,
-                    referer=resolved_form_url,
-                    tournament_id=tournament_id,
-                    request_candidates=request_candidates,
-                    prefer_post=False,
-                )
+                ajax_confirmed = False
+                try:
+                    submit_html, submit_url, ajax_confirmed = await self._submit_request_via_ajax(
+                        session=session,
+                        form_fields=form_data.fields,
+                        referer=resolved_form_url,
+                    )
+                except RatingSiteError as ajax_exc:
+                    logger.info(
+                        "rating_submit ajax_submit_failed tournament_id=%s error=%s",
+                        tournament_id,
+                        ajax_exc,
+                    )
+                    submit_html, submit_url = await self._submit_request_with_fallback(
+                        session=session,
+                        action_url=form_data.action_url,
+                        form_method=form_data.method,
+                        form_fields=form_data.fields,
+                        referer=resolved_form_url,
+                        tournament_id=tournament_id,
+                        request_candidates=request_candidates,
+                        prefer_post=False,
+                    )
 
-                self._raise_if_login_page(submit_url, submit_html)
-                self._raise_if_site_error(submit_html)
-                request_id = self._extract_request_id(submit_url, submit_html)
+                submit_html_checked = "" if self._is_json_payload(submit_html) else submit_html
+                self._raise_if_login_page(submit_url, submit_html_checked)
+                self._raise_if_site_error(submit_html_checked)
+                request_id = self._extract_request_id(submit_url, submit_html_checked)
                 after_request_ids = await self._safe_get_request_ids_from_api(
                     session=session,
                     tournament_id=tournament_id,
@@ -139,19 +154,20 @@ class RatingSiteClient:
                     after_request_ids=after_request_ids,
                 )
                 submit_path = urlparse(submit_url).path or "/"
-                submit_messages = self._extract_form_messages(submit_html)
+                submit_messages = self._extract_form_messages(submit_html_checked)
                 logger.info(
-                    "rating_submit first_result tournament_id=%s path=%s request_id=%s success_marker=%s form_like=%s messages=%s",
+                    "rating_submit first_result tournament_id=%s path=%s request_id=%s ajax_confirmed=%s success_marker=%s form_like=%s messages=%s",
                     tournament_id,
                     submit_path,
                     request_id,
-                    self._has_success_marker(submit_html),
-                    self._looks_like_request_form_page(submit_url, submit_html),
+                    ajax_confirmed,
+                    self._has_success_marker(submit_html_checked),
+                    self._looks_like_request_form_page(submit_url, submit_html_checked),
                     submit_messages[:3],
                 )
 
-                is_confirmed = request_id is not None
-                if not is_confirmed and self._has_success_marker(submit_html):
+                is_confirmed = ajax_confirmed or request_id is not None
+                if not is_confirmed and self._has_success_marker(submit_html_checked):
                     # Fallback: UI may show server-side success message without requestId.
                     is_confirmed = True
                 if not is_confirmed:
@@ -181,10 +197,12 @@ class RatingSiteClient:
                             )
                             continue
 
-                        self._raise_if_login_page(retry_url, retry_html)
-                        self._raise_if_site_error(retry_html)
+                        retry_html_checked = "" if self._is_json_payload(retry_html) else retry_html
+                        self._raise_if_login_page(retry_url, retry_html_checked)
+                        self._raise_if_site_error(retry_html_checked)
                         submit_html, submit_url = retry_html, retry_url
-                        request_id = self._extract_request_id(submit_url, submit_html)
+                        submit_html_checked = retry_html_checked
+                        request_id = self._extract_request_id(submit_url, retry_html_checked)
                         after_request_ids = await self._safe_get_request_ids_from_api(
                             session=session,
                             tournament_id=tournament_id,
@@ -194,9 +212,9 @@ class RatingSiteClient:
                             before_request_ids=before_request_ids,
                             after_request_ids=after_request_ids,
                         )
-                        retry_messages = self._extract_form_messages(submit_html)
+                        retry_messages = self._extract_form_messages(retry_html_checked)
                         is_confirmed = request_id is not None
-                        if not is_confirmed and self._has_success_marker(submit_html):
+                        if not is_confirmed and self._has_success_marker(retry_html_checked):
                             is_confirmed = True
                         logger.info(
                             "rating_submit forced_result tournament_id=%s method=%s path=%s request_id=%s success_marker=%s messages=%s",
@@ -204,7 +222,7 @@ class RatingSiteClient:
                             attempt_method,
                             self._url_path_and_query(submit_url),
                             request_id,
-                            self._has_success_marker(submit_html),
+                            self._has_success_marker(retry_html_checked),
                             retry_messages[:3],
                         )
                         if is_confirmed:
@@ -213,7 +231,7 @@ class RatingSiteClient:
                     before_count = len(before_request_ids) if before_request_ids is not None else "?"
                     after_count = len(after_request_ids) if after_request_ids is not None else "?"
                     final_path = urlparse(submit_url).path or "/"
-                    messages = self._extract_form_messages(submit_html)
+                    messages = self._extract_form_messages(submit_html_checked)
                     detail = f" Детали формы: {' | '.join(messages[:3])}." if messages else ""
                     logger.warning(
                         "rating_submit unconfirmed tournament_id=%s path=%s before=%s after=%s messages=%s",
@@ -339,6 +357,51 @@ class RatingSiteClient:
             ) from last_405_error
 
         raise RatingSiteError("Не удалось отправить заявку: все варианты отправки завершились ошибкой.")
+
+    async def _submit_request_via_ajax(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        form_fields: dict[str, str],
+        referer: str,
+    ) -> tuple[str, str, bool]:
+        origin = self._origin_from_url(referer)
+        submit_url = f"{origin}/synch/request/save_new"
+        async with session.post(
+            submit_url,
+            data=form_fields,
+            allow_redirects=True,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": referer,
+                "Origin": origin,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        ) as response:
+            text = await response.text()
+            if response.status >= 400:
+                base = self._http_error_message(response.status, str(response.url))
+                detail = self._extract_error_detail_from_html(text)
+                headers_hint = self._extract_error_headers(response.headers)
+                prefix = "[request_submit_ajax] "
+                if detail:
+                    raise RatingSiteError(f"{prefix}{base} {detail} {headers_hint}".strip())
+                raise RatingSiteError(f"{prefix}{base} {headers_hint}".strip())
+
+            final_url = str(response.url)
+            confirmed = False
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+
+            if isinstance(payload, dict):
+                redirect_url = payload.get("redirectUrl")
+                if isinstance(redirect_url, str) and redirect_url.strip():
+                    final_url = urljoin(origin + "/", redirect_url.strip())
+                    confirmed = True
+
+            return text, final_url, confirmed
 
     def _build_request_fallback_url(self, *, tournament_id: int, referer: str) -> str:
         parsed = urlparse(referer)
@@ -557,6 +620,10 @@ class RatingSiteClient:
         if parsed.query:
             return f"{parsed.path or '/'}?{parsed.query}"
         return parsed.path or "/"
+
+    def _is_json_payload(self, text: str) -> bool:
+        candidate = (text or "").lstrip()
+        return bool(candidate) and candidate[0] in "{["
 
     def _extract_request_candidates(self, html: str) -> list[str]:
         if not html:
