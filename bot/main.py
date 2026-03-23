@@ -63,6 +63,8 @@ PENDING_ANNOUNCE_COMMENT = "announce_comment"
 DATE_PICKER_DAYS = 60
 DATE_CALLBACK_IGNORE = "date:ignore"
 DATE_CALLBACK_PICK_PREFIX = "date:pick:"
+LOGIN_CALLBACK_EMAIL_DEFAULT = "login:email:default"
+LOGIN_CALLBACK_EMAIL_CUSTOM = "login:email:custom"
 REQUEST_CALLBACK_START_PREFIX = "request:start:"
 REQUEST_CALLBACK_VENUE_DEFAULT = "request:venue:default"
 REQUEST_CALLBACK_VENUE_CUSTOM = "request:venue:custom"
@@ -148,6 +150,7 @@ class RuntimeState:
     selected_tournament_ids: set[int] = field(default_factory=set)
     submitted_request_time_by_tournament: dict[int, str] = field(default_factory=dict)
     announcement_drafts: dict[int, AnnouncementDraft] = field(default_factory=dict)
+    announcement_field_defaults: dict[str, str] = field(default_factory=dict)
     active_announcement_tournament_id: int | None = None
     request_draft: TournamentRequestDraft | None = None
 
@@ -446,6 +449,35 @@ def build_request_time_choice_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def build_login_email_choice_markup(email: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"✅ Использовать {email}", callback_data=LOGIN_CALLBACK_EMAIL_DEFAULT)],
+            [InlineKeyboardButton("✏️ Ввести другой email", callback_data=LOGIN_CALLBACK_EMAIL_CUSTOM)],
+        ]
+    )
+
+
+def build_announce_default_value_markup(*, tournament_id: int, field: str, value: str) -> InlineKeyboardMarkup:
+    short_value = value if len(value) <= 40 else value[:37] + "..."
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"✅ Оставить: {short_value}",
+                    callback_data=f"announce:use:{tournament_id}:{field}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Ввести другое",
+                    callback_data=f"announce:input:{tournament_id}:{field}",
+                )
+            ],
+        ]
+    )
+
+
 def truncate_option(text: str, max_len: int = 100) -> str:
     if len(text) <= max_len:
         return text
@@ -490,6 +522,59 @@ def is_expired_jwt_error(exc: RatingApiError) -> bool:
         or ("jwt" in message and "expired" in message)
         or ("token" in message and "expired" in message)
     )
+
+
+def is_auth_failure_error(exc: RatingApiError) -> bool:
+    message = str(exc).casefold()
+    return (
+        is_expired_jwt_error(exc)
+        or "unauthorized" in message
+        or "forbidden" in message
+        or "401" in message
+        or "403" in message
+    )
+
+
+async def ensure_active_session(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    alert_message: str | None = None,
+) -> bool:
+    storage = get_storage(context)
+    persisted = storage.get_user_state(user_id)
+    if not persisted.rating_token:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=alert_message or "Сессия неактивна. Нажмите «Авторизация» и войдите снова.",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return False
+
+    api = get_rating_api(context)
+    try:
+        await api.get_current_user(persisted.rating_token)
+        return True
+    except RatingApiError as exc:
+        if is_auth_failure_error(exc):
+            storage.clear_rating_token(user_id)
+            state = get_runtime_state(context, user_id)
+            state.pending_action = None
+            state.request_draft = None
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Сессия истекла. Нажмите «Авторизация» и войдите снова.",
+                reply_markup=main_menu_markup(context, user_id),
+            )
+            return False
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Не удалось проверить сессию: {exc}",
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return False
 
 
 async def notify_tournaments_error(
@@ -577,11 +662,28 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = get_runtime_state(context, update.effective_user.id)
-    state.pending_action = PENDING_LOGIN_EMAIL
-    state.temp_email = None
+    storage = get_storage(context)
+    persisted = storage.get_user_state(update.effective_user.id)
 
+    state.temp_email = None
+    if persisted.rating_email:
+        state.pending_action = None
+        await update.message.reply_text(
+            (
+                "Выберите логин для входа на rating.chgk.info.\n"
+                f"Сохраненный логин: {persisted.rating_email}\n"
+                "Пароль не сохраняется. Сообщение с паролем будет удалено."
+            ),
+            reply_markup=build_login_email_choice_markup(persisted.rating_email),
+        )
+        return
+
+    state.pending_action = PENDING_LOGIN_EMAIL
     await update.message.reply_text(
-        "Введите email от rating.chgk.info.",
+        (
+            "Введите email от rating.chgk.info.\n"
+            "Пароль не сохраняется. Сообщение с паролем будет удалено."
+        ),
         reply_markup=main_menu_markup(context, update.effective_user.id),
     )
 
@@ -612,16 +714,17 @@ async def create_venue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat is None or update.effective_user is None:
         return
 
-    storage = get_storage(context)
-    persisted = storage.get_user_state(update.effective_user.id)
+    if not await ensure_active_session(
+        context=context,
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+    ):
+        return
 
-    if not persisted.rating_token:
-        text = "Сначала авторизуйтесь через меню."
-    else:
-        text = (
-            "Создание площадки в боте пока отключено.\n"
-            "Используйте форму на rating.chgk.info, затем вернитесь в бот."
-        )
+    text = (
+        "Создание площадки в боте пока отключено.\n"
+        "Используйте форму на rating.chgk.info, затем вернитесь в бот."
+    )
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -634,14 +737,11 @@ async def request_representative_date(update: Update, context: ContextTypes.DEFA
     if update.message is None or update.effective_user is None:
         return
 
-    storage = get_storage(context)
-    persisted = storage.get_user_state(update.effective_user.id)
-
-    if not persisted.rating_token:
-        await update.message.reply_text(
-            "Сессия неактивна. Нажмите «Авторизация» и войдите снова.",
-            reply_markup=main_menu_markup(context, update.effective_user.id),
-        )
+    if not await ensure_active_session(
+        context=context,
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+    ):
         return
 
     state = get_runtime_state(context, update.effective_user.id)
@@ -906,6 +1006,8 @@ async def start_announcement_for_tournament(
         date_phrase=date_phrase,
         time_text=default_time,
     )
+    if default_time:
+        state.announcement_field_defaults["time"] = default_time
     state.active_announcement_tournament_id = tournament_id
     state.pending_action = None
     await send_announcement_preview(
@@ -973,9 +1075,16 @@ async def start_request_flow(
     tournament_id: int | None = None,
 ) -> None:
     storage = get_storage(context)
-    persisted = storage.get_user_state(user_id)
     state = get_runtime_state(context, user_id)
 
+    if not await ensure_active_session(
+        context=context,
+        user_id=user_id,
+        chat_id=chat_id,
+    ):
+        return
+
+    persisted = storage.get_user_state(user_id)
     if not persisted.rating_email:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -998,7 +1107,7 @@ async def start_request_flow(
             chat_id=chat_id,
             text=(
                 "Введите пароль от rating.chgk.info для автоподстановки данных заявки.\n"
-                "Сообщение с паролем будет удалено."
+                "Пароль не сохраняется. Сообщение с паролем будет удалено."
             ),
             reply_markup=main_menu_markup(context, user_id),
         )
@@ -1085,6 +1194,13 @@ async def create_poll(
     chat_id: int,
     user_id: int,
 ) -> None:
+    if not await ensure_active_session(
+        context=context,
+        user_id=user_id,
+        chat_id=chat_id,
+    ):
+        return
+
     runtime_state = get_runtime_state(context, user_id)
 
     if not runtime_state.selected_tournament_ids:
@@ -1175,7 +1291,156 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     callback_chat_id = get_callback_chat_id(update)
 
+    if data == LOGIN_CALLBACK_EMAIL_DEFAULT:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        storage = get_storage(context)
+        persisted = storage.get_user_state(user_id)
+        if not persisted.rating_email:
+            await query.answer("Сохраненный email не найден.", show_alert=True)
+            return
+
+        state = get_runtime_state(context, user_id)
+        state.temp_email = persisted.rating_email
+        state.pending_action = PENDING_LOGIN_PASSWORD
+        await query.answer("Используем сохраненный email.")
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text=(
+                "Введите пароль от rating.chgk.info.\n"
+                "Пароль не сохраняется. Сообщение с паролем будет удалено."
+            ),
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    if data == LOGIN_CALLBACK_EMAIL_CUSTOM:
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        state = get_runtime_state(context, user_id)
+        state.temp_email = None
+        state.pending_action = PENDING_LOGIN_EMAIL
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text=(
+                "Введите другой email от rating.chgk.info.\n"
+                "Пароль не сохраняется. Сообщение с паролем будет удалено."
+            ),
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
+    if data.startswith("announce:use:"):
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
+        payload = data.removeprefix("announce:use:")
+        raw_tournament_id, _, field = payload.partition(":")
+        if not raw_tournament_id.isdigit():
+            await query.answer("Некорректная команда.", show_alert=True)
+            return
+        tournament_id = int(raw_tournament_id)
+        state = get_runtime_state(context, user_id)
+        draft = state.announcement_drafts.get(tournament_id)
+        if draft is None:
+            await query.answer("Сначала нажмите «Написать анонс».", show_alert=True)
+            return
+        default_value = state.announcement_field_defaults.get(field)
+        if not default_value:
+            await query.answer("Значение по умолчанию не найдено.", show_alert=True)
+            return
+
+        if field == "time":
+            draft.time_text = default_value
+        elif field == "address":
+            draft.address = default_value
+        elif field == "cost":
+            draft.cost = default_value
+        elif field == "comment":
+            draft.comment = default_value
+        else:
+            await query.answer("Некорректное поле.", show_alert=True)
+            return
+
+        state.pending_action = None
+        state.active_announcement_tournament_id = tournament_id
+        await query.answer("Значение применено.")
+        await send_announcement_preview(
+            context=context,
+            chat_id=callback_chat_id,
+            user_id=user_id,
+            tournament_id=tournament_id,
+        )
+        return
+
+    if data.startswith("announce:input:"):
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
+        payload = data.removeprefix("announce:input:")
+        raw_tournament_id, _, field = payload.partition(":")
+        if not raw_tournament_id.isdigit():
+            await query.answer("Некорректная команда.", show_alert=True)
+            return
+        tournament_id = int(raw_tournament_id)
+        state = get_runtime_state(context, user_id)
+        if tournament_id not in state.announcement_drafts:
+            await query.answer("Сначала нажмите «Написать анонс».", show_alert=True)
+            return
+        field_to_pending = {
+            "time": PENDING_ANNOUNCE_TIME,
+            "address": PENDING_ANNOUNCE_ADDRESS,
+            "cost": PENDING_ANNOUNCE_COST,
+            "comment": PENDING_ANNOUNCE_COMMENT,
+        }
+        prompt_by_field = {
+            "time": "Введите новое время для анонса (любой формат).",
+            "address": "Введите адрес (любой формат).",
+            "cost": "Введите стоимость (любой формат).",
+            "comment": "Введите комментарий (любой формат).",
+        }
+        pending = field_to_pending.get(field)
+        if pending is None:
+            await query.answer("Некорректное поле.", show_alert=True)
+            return
+        state.active_announcement_tournament_id = tournament_id
+        state.pending_action = pending
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=callback_chat_id,
+            text=prompt_by_field[field],
+            reply_markup=main_menu_markup(context, user_id),
+        )
+        return
+
     if data.startswith("vote:"):
+        if callback_chat_id is None:
+            await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         raw_id = data.split(":", 1)[1]
         if not raw_id.isdigit():
             return
@@ -1209,6 +1474,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
 
         raw_id = data.removeprefix(REQUEST_CALLBACK_START_PREFIX)
         tournament_id = int(raw_id) if raw_id.isdigit() else None
@@ -1224,6 +1496,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith(ANNOUNCE_CALLBACK_START_PREFIX):
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
         raw_id = data.removeprefix(ANNOUNCE_CALLBACK_START_PREFIX)
         if not raw_id.isdigit():
@@ -1241,6 +1520,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == REQUEST_CALLBACK_VENUE_DEFAULT:
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
         state = get_runtime_state(context, user_id)
         draft = state.request_draft
@@ -1261,6 +1547,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         state = get_runtime_state(context, user_id)
         state.pending_action = PENDING_REQUEST_VENUE
         await query.answer()
@@ -1274,6 +1567,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == REQUEST_CALLBACK_REPRESENTATIVE_DEFAULT:
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
         state = get_runtime_state(context, user_id)
         draft = state.request_draft
@@ -1294,6 +1594,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         state = get_runtime_state(context, user_id)
         state.pending_action = PENDING_REQUEST_REPRESENTATIVE
         await query.answer()
@@ -1307,6 +1614,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == REQUEST_CALLBACK_DATE_DEFAULT:
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
         state = get_runtime_state(context, user_id)
         draft = state.request_draft
@@ -1327,6 +1641,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         state = get_runtime_state(context, user_id)
         state.pending_action = PENDING_REQUEST_DATE
         await query.answer()
@@ -1341,6 +1662,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         state = get_runtime_state(context, user_id)
         state.pending_action = PENDING_REQUEST_TIME
         await query.answer()
@@ -1354,6 +1682,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith(REQUEST_CALLBACK_TIME_PREFIX):
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
         selected_time = data.removeprefix(REQUEST_CALLBACK_TIME_PREFIX)
         if selected_time not in REQUEST_MOSCOW_TIME_OPTIONS:
@@ -1381,6 +1716,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         payload = data.removeprefix(ANNOUNCE_CALLBACK_EDIT_PREFIX)
         raw_tournament_id, _, field = payload.partition(":")
         if not raw_tournament_id.isdigit() or field not in ANNOUNCE_EDITABLE_FIELDS:
@@ -1389,7 +1731,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         tournament_id = int(raw_tournament_id)
         state = get_runtime_state(context, user_id)
-        if tournament_id not in state.announcement_drafts:
+        draft = state.announcement_drafts.get(tournament_id)
+        if draft is None:
             await query.answer("Сначала нажмите «Написать анонс».", show_alert=True)
             return
 
@@ -1408,6 +1751,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "cost": "Введите стоимость (любой формат).",
             "comment": "Введите комментарий (любой формат).",
         }
+        if field in {"time", "address", "cost", "comment"}:
+            field_title = {
+                "time": "время",
+                "address": "адрес",
+                "cost": "стоимость",
+                "comment": "комментарий",
+            }
+            current_value_map = {
+                "time": draft.time_text,
+                "address": draft.address,
+                "cost": draft.cost,
+                "comment": draft.comment,
+            }
+            default_value = current_value_map.get(field) or state.announcement_field_defaults.get(field)
+            if default_value:
+                state.announcement_field_defaults[field] = default_value
+                state.pending_action = None
+                await query.answer()
+                await context.bot.send_message(
+                    chat_id=callback_chat_id,
+                    text=f"Поле «{field_title[field]}»: использовать последнее значение или ввести новое?",
+                    reply_markup=build_announce_default_value_markup(
+                        tournament_id=tournament_id,
+                        field=field,
+                        value=default_value,
+                    ),
+                )
+                return
+
         state.pending_action = field_to_pending[field]
         await query.answer()
         await context.bot.send_message(
@@ -1421,6 +1793,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
             return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
+            return
         await query.answer()
         await create_poll(context=context, chat_id=callback_chat_id, user_id=user_id)
         return
@@ -1432,6 +1811,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith(DATE_CALLBACK_PICK_PREFIX):
         if callback_chat_id is None:
             await query.answer("Не удалось определить чат.", show_alert=True)
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=callback_chat_id,
+        ):
+            await query.answer("Нужна повторная авторизация.", show_alert=True)
             return
 
         raw_date = data.removeprefix(DATE_CALLBACK_PICK_PREFIX)
@@ -1554,6 +1940,7 @@ async def submit_request_draft(
     )
     if draft.tournament_id is not None and draft.request_time:
         state.submitted_request_time_by_tournament[draft.tournament_id] = draft.request_time
+        state.announcement_field_defaults["time"] = draft.request_time
     reset_request_draft(state)
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1602,7 +1989,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if state.pending_action == PENDING_LOGIN_EMAIL:
         state.temp_email = text
         state.pending_action = PENDING_LOGIN_PASSWORD
-        await update.message.reply_text("Теперь введите пароль от rating.chgk.info.")
+        await update.message.reply_text(
+            (
+                "Теперь введите пароль от rating.chgk.info.\n"
+                "Пароль не сохраняется. Сообщение с паролем будет удалено."
+            )
+        )
         return
 
     if state.pending_action == PENDING_LOGIN_PASSWORD:
@@ -1663,6 +2055,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=main_menu_markup(context, user_id),
         )
         return
+
+    auth_sensitive_pending_actions = {
+        PENDING_REQUEST_SITE_PASSWORD,
+        PENDING_REQUEST_TOURNAMENT,
+        PENDING_REQUEST_VENUE,
+        PENDING_REQUEST_REPRESENTATIVE,
+        PENDING_REQUEST_DATE,
+        PENDING_REQUEST_TIME,
+        PENDING_REQUEST_TEAMS,
+        PENDING_REQUEST_NARRATOR,
+        PENDING_REQUEST_COMMENT,
+        PENDING_REQUEST_PASSWORD,
+        PENDING_ANNOUNCE_DATE,
+        PENDING_ANNOUNCE_TIME,
+        PENDING_ANNOUNCE_ADDRESS,
+        PENDING_ANNOUNCE_COST,
+        PENDING_ANNOUNCE_COMMENT,
+    }
+    if state.pending_action in auth_sensitive_pending_actions:
+        if update.effective_chat is None:
+            return
+        if not await ensure_active_session(
+            context=context,
+            user_id=user_id,
+            chat_id=update.effective_chat.id,
+        ):
+            return
 
     if state.pending_action == PENDING_REQUEST_SITE_PASSWORD:
         if state.request_draft is None:
@@ -1872,7 +2291,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 (
                     "Шаг 8/8: введите пароль от rating.chgk.info для отправки заявки.\n"
                     f"Используется email: {email_label}\n"
-                    "Если нужен другой аккаунт, сначала выполните «Авторизация»."
+                    "Если нужен другой аккаунт, сначала выполните «Авторизация».\n"
+                    "Пароль не сохраняется. Сообщение с паролем будет удалено."
                 )
             )
         return
@@ -1922,12 +2342,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             draft.date_phrase = value
         elif state.pending_action == PENDING_ANNOUNCE_TIME:
             draft.time_text = value
+            state.announcement_field_defaults["time"] = value
         elif state.pending_action == PENDING_ANNOUNCE_ADDRESS:
             draft.address = value
+            state.announcement_field_defaults["address"] = value
         elif state.pending_action == PENDING_ANNOUNCE_COST:
             draft.cost = value
+            state.announcement_field_defaults["cost"] = value
         elif state.pending_action == PENDING_ANNOUNCE_COMMENT:
             draft.comment = value
+            state.announcement_field_defaults["comment"] = value
 
         state.pending_action = None
         await send_announcement_preview(
